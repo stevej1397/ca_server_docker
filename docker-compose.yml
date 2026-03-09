@@ -1,0 +1,67 @@
+version: '3.8'
+
+services:
+  ca:
+    build:
+      context: ./ca
+      dockerfile: Dockerfile
+    container_name: ca_authority
+    environment:
+      - STEPPATH=/home/step/certs
+      - CERT_DURATION=2160h
+      - MAX_CERT_DURATION=8760h
+    ports:
+      - "9000:9000"
+    volumes:
+      - ca_certs:/home/step/certs
+      - ca_config:/home/step/.step
+    networks:
+      - ca_network
+    healthcheck:
+      test: ["CMD", "step", "ca", "health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: ca_backend
+    environment:
+      - NODE_ENV=production
+      - CA_URL=http://ca:9000
+      - ADMIN_USERNAME=admin
+      - ADMIN_PASSWORD=changeme
+    ports:
+      - "3001:3001"
+    depends_on:
+      ca:
+        condition: service_healthy
+    volumes:
+      - ./backend:/app
+      - /app/node_modules
+    networks:
+      - ca_network
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: ca_frontend
+    environment:
+      - REACT_APP_API_URL=http://localhost:3001/api
+    ports:
+      - "3000:3000"
+    depends_on:
+      - backend
+    networks:
+      - ca_network
+
+volumes:
+  ca_certs:
+  ca_config:
+
+networks:
+  ca_network:
+    driver: bridge
