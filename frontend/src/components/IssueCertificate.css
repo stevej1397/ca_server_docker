@@ -1,0 +1,128 @@
+.issue-certificate h1 {
+  margin-top: 0;
+  margin-bottom: 2rem;
+}
+
+.issue-certificate form {
+  max-width: 500px;
+}
+
+.form-group {
+  margin-bottom: 2rem;
+}
+
+.form-group label {
+  display: block;
+  margin-bottom: 0.5rem;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.form-group input {
+  width: 100%;
+  padding: 0.75rem;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background-color: var(--bg-primary);
+  color: var(--text-primary);
+  font-size: 1rem;
+  transition: border-color 0.3s ease;
+}
+
+.form-group input:focus {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.1);
+}
+
+.form-group input:disabled {
+  background-color: var(--bg-secondary);
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.form-group small {
+  display: block;
+  margin-top: 0.5rem;
+  color: var(--text-secondary);
+  font-size: 0.875rem;
+}
+
+.btn-large {
+  padding: 0.75rem 2rem;
+  font-size: 1.125rem;
+  width: 100%;
+  font-weight: 600;
+}
+
+.btn-large:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.success-details {
+  background-color: rgba(16, 185, 129, 0.1);
+  border: 1px solid var(--success);
+  border-radius: 8px;
+}
+
+.success-details h2 {
+  color: var(--success);
+}
+
+.success-details table {
+  width: 100%;
+}
+
+.success-details td {
+  padding: 0.75rem;
+  border-bottom: 1px solid var(--border);
+}
+
+.success-details td:first-child {
+  width: 120px;
+  color: var(--text-secondary);
+}
+
+.monospace {
+  font-family: 'Courier New', monospace;
+  font-size: 0.875rem;
+  background-color: var(--bg-secondary);
+  padding: 0.25rem 0.5rem;
+  border-radius: 4px;
+  word-break: break-all;
+}
+
+.info {
+  background-color: rgba(59, 130, 246, 0.1);
+  border-left: 4px solid var(--accent);
+}
+
+.info h2 {
+  color: var(--accent);
+  margin-top: 0;
+}
+
+.info ul {
+  margin: 0;
+  padding-left: 2rem;
+}
+
+.info li {
+  margin-bottom: 0.75rem;
+  color: var(--text-primary);
+}
+
+.info strong {
+  color: var(--accent);
+}
+
+@media (max-width: 768px) {
+  .issue-certificate {
+    padding: 0;
+  }
+
+  .form-group input {
+    font-size: 16px;
+  }
+}

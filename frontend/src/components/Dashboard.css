@@ -1,0 +1,85 @@
+.dashboard h1 {
+  margin-bottom: 2rem;
+  font-size: 2rem;
+}
+
+.stats-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+  gap: 2rem;
+  margin-bottom: 3rem;
+}
+
+.stat-card {
+  background-color: var(--bg-secondary);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 2rem;
+  box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+}
+
+.stat-card h3 {
+  margin: 0 0 1rem 0;
+  font-size: 0.875rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--text-secondary);
+  font-weight: 600;
+}
+
+.stat-value {
+  font-size: 2rem;
+  font-weight: 700;
+  margin: 0.5rem 0;
+  color: var(--text-primary);
+}
+
+.stat-detail {
+  font-size: 0.875rem;
+  color: var(--text-secondary);
+  margin: 0.5rem 0 0 0;
+}
+
+.info-section {
+  margin-bottom: 3rem;
+}
+
+.info-section h2 {
+  margin-bottom: 1.5rem;
+}
+
+.info-card {
+  background-color: var(--bg-secondary);
+  border-left: 4px solid var(--accent);
+  border-radius: 0 4px 4px 0;
+  padding: 1.5rem;
+  margin-bottom: 1rem;
+}
+
+.info-card h3 {
+  margin-top: 0;
+  color: var(--accent);
+}
+
+.monospace {
+  font-family: 'Courier New', monospace;
+  font-size: 0.875rem;
+  background-color: var(--bg-primary);
+  padding: 0.25rem 0.5rem;
+  border-radius: 4px;
+  overflow-x: auto;
+  word-break: break-all;
+}
+
+table tbody tr {
+  border-bottom: 1px solid var(--border);
+}
+
+table td {
+  padding: 1rem;
+}
+
+table td:first-child {
+  width: 200px;
+  color: var(--text-secondary);
+}
