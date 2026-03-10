@@ -3,6 +3,7 @@
 set -e
 
 STEPPATH="${STEPPATH:=/home/step/certs}"
+CA_PASSWORD="${CA_PASSWORD:=changeme}"
 export STEPPATH
 
 # Initialize CA if not already initialized
@@ -15,7 +16,7 @@ if [ ! -f "${STEPPATH}/config/ca.json" ]; then
         --dns localhost \
         --address :9000 \
         --provisioner "admin" \
-        --password-file <(echo "changeme") \
+        --password-file <(echo "${CA_PASSWORD}") \
         --with-db=false \
         --acme \
         || true
@@ -30,5 +31,5 @@ if [ ! -f "${STEPPATH}/config/ca.json" ]; then
     fi
 fi
 
-# Start Step CA
+# Start Step CA${CA_PASSWORD}
 step-ca "${STEPPATH}/config/ca.json" --password-file <(echo "changeme")

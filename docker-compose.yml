@@ -10,11 +10,12 @@ services:
       - STEPPATH=/home/step/certs
       - CERT_DURATION=2160h
       - MAX_CERT_DURATION=8760h
+      - CA_PASSWORD=${CA_PASSWORD}
     ports:
       - "9000:9000"
     volumes:
-      - ca_certs:/home/step/certs
-      - ca_config:/home/step/.step
+      - ${VOLUMES_PATH}/ca_certs:/home/step/certs
+      - ${VOLUMES_PATH}/ca_config:/home/step/.step
     networks:
       - ca_network
     healthcheck:
@@ -30,8 +31,8 @@ services:
     container_name: ca_backend
     environment:
       - NODE_ENV=production
-      - CA_URL=http://ca:9000
-      - ADMIN_USERNAME=admin
+      - CA_URL=http://c${ADMIN_USERNAME}
+      - ADMIN_PASSWORD=${ADMIN_PASSWORD}
       - ADMIN_PASSWORD=changeme
     ports:
       - "3001:3001"
@@ -57,10 +58,6 @@ services:
       - backend
     networks:
       - ca_network
-
-volumes:
-  ca_certs:
-  ca_config:
 
 networks:
   ca_network:
