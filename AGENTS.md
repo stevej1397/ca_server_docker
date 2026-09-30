@@ -91,7 +91,12 @@ See the "Devices Using This CA" section of `README.md` for the user-facing detai
   - Runs daily at 03:27 from `/boot/config/plugins/dynamix/udm-cert.cron`, installed by the user on 2026-09-29.
     `update_cron` merges that file into `/etc/cron.d/root`, so check with `grep udm /etc/cron.d/root`, not `crontab -l`.
     The auto-mode classifier blocks agents from installing cron jobs; give the user the command instead.
-- Homarr (container `homarr`): trusts `/mnt/user/appdata/homarr/appdata/trusted-certificates/*.crt|*.pem` on top of Node's public roots, re-read on every request. `home-lab-root-ca.crt` there is this CA's root. `NODE_TLS_REJECT_UNAUTHORIZED=0` is still set in its Unraid template.
+- Homarr (container `homarr`, Unraid template `/boot/config/plugins/dockerMan/templates-user/my-homarr.xml`):
+  - Integrations trust `/mnt/user/appdata/homarr/appdata/trusted-certificates/*.crt|*.pem` on top of Node's public roots, re-read on every request. `home-lab-root-ca.crt` there is this CA's root.
+  - Custom widgets use plain global `fetch` and ignore that folder, so the template sets `NODE_EXTRA_CA_CERTS` to the same root file.
+  - `NODE_TLS_REJECT_UNAUTHORIZED=0` was removed on 2026-09-29, so TLS checking is on.
+  - Integrations and custom widgets are in `appdata/db/db.sqlite` (tables `integration` and `custom_widget_definition`). Open it with `sqlite3 "file:...?immutable=1"`.
+  - Recreate the container with `/usr/local/emhttp/plugins/dynamix.docker.manager/scripts/rebuild_container homarr`. Autostart is off, so run `docker start homarr` afterward.
 
 ## Practical Workflow
 

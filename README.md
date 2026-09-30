@@ -193,8 +193,14 @@ Homarr trusts Node's public CAs plus every `.crt`/`.pem` in `/mnt/user/appdata/h
 You can also manage that folder from Management → Tools → Certificates in the Homarr UI.
 
 - `home-lab-root-ca.crt` in that folder is this CA's root. It is required: the intermediate alone gives `UNABLE_TO_GET_ISSUER_CERT`.
-- The container still has `NODE_TLS_REJECT_UNAUTHORIZED=0` in its Unraid template, which turns off TLS checking entirely.
-  It can be removed now that the root is trusted. Check each integration afterward.
+- The folder only covers integrations. Custom widgets (e.g. "Unifi Traffic") call plain `fetch()`, which ignores it.
+  The Unraid template therefore also sets `NODE_EXTRA_CA_CERTS=/appdata/trusted-certificates/home-lab-root-ca.crt`,
+  which Node reads once at startup.
+- TLS checking is on: `NODE_TLS_REJECT_UNAUTHORIZED=0` was removed from the template on 2026-09-29.
+  The previous template is saved as `/boot/config/plugins/dockerMan/templates-user/my-homarr.xml.bak-2026-09-29`.
+- To trust some other self-signed service, add its cert to the folder (integrations) and restart the container
+  (custom widgets only see `NODE_EXTRA_CA_CERTS`). A cert issued by this CA is simpler; it only has to cover the name or IP Homarr uses.
+- Homarr's autostart is off, so editing the template in the Docker tab leaves the container stopped. Start it afterward.
 
 To test a host from inside Homarr, using the same trust list Homarr builds and with checking forced on, change `URL`:
 
