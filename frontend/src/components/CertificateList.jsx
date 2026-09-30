@@ -152,6 +152,20 @@ function CertificateList() {
                         Revoke
                       </button>
                     )}
+                    <a
+                      className="btn-primary btn-sm"
+                      href={`/api/certificates/${cert.id}/download`}
+                      download
+                    >
+                      Download Cert
+                    </a>
+                    <a
+                      className="btn-secondary btn-sm"
+                      href={`/api/certificates/${cert.id}/download-key`}
+                      download
+                    >
+                      Download Key
+                    </a>
                     <button 
                       className="btn-delete btn-sm"
                       onClick={() => deleteCertificate(cert.id)}

@@ -1,0 +1,1199 @@
+<?xml version='1.0' standalone='yes'?>
+<PLUGIN
+  name="step-ca-webgui-acme"
+  author="OpenAI Codex"
+  version="2026.09.22"
+  launch="Settings/step-ca-webgui-acme"
+  pluginURL="https://raw.githubusercontent.com/REPLACE_ME/ca_server_docker/main/unraid-plugin/step-ca-webgui-acme.plg"
+  min="6.12.0"
+  support="https://github.com/REPLACE_ME/ca_server_docker">
+
+<CHANGES>
+### 2026.09.22
+- Stop the renewal cron job from also appending to issue.log. The script already tees its own output there, so every line was logged twice.
+- Remove previously installed plugin files before installing, since Unraid never overwrites an existing file and in-place updates otherwise only took effect after a reboot.
+
+### 2026.09.09
+- Detect the bundled acme.sh with a plain file test so renewal is not retried from scratch on every run, since /boot is vfat and can never carry an executable bit.
+- Install acme.sh by copying the extracted tree directly instead of invoking its own installer, which depended on the current working directory and failed under cron.
+- Drop the bundled OpenSSL 1.1 libraries. They were emitted as raw binary into XML CDATA, which corrupted the plugin file, and Unraid already ships OpenSSL 3.
+
+### 2026.04.12
+- Fix renewal for short-lived ACME certificates by forcing renewals based on the real installed certificate expiry.
+- Run the bundled acme.sh client through `sh` so renewal still works when the script lives on `/boot`.
+</CHANGES>
+
+<!-- Unraid skips any FILE that already exists, so clear the old install first or updates never land. -->
+<FILE Run="/bin/bash">
+<INLINE><![CDATA[
+rm -rf "/usr/local/emhttp/plugins/step-ca-webgui-acme"
+]]></INLINE>
+</FILE>
+
+<FILE Name="/usr/local/emhttp/plugins/step-ca-webgui-acme/README.md">
+<INLINE><![CDATA[
+# Unraid Step CA WebGUI ACME Plugin
+
+This plugin is meant for Unraid systems that should obtain their WebGUI certificate from the Step CA ACME endpoint exposed by this repository.
+
+## What it does
+
+- Uses `acme.sh` against your Step CA ACME directory.
+- Downloads the Step CA root bundle from `roots.pem`.
+- Issues or renews a certificate for the Unraid WebGUI hostname.
+- Writes the custom certificate bundle Unraid expects at `/boot/config/ssl/certs/[servername]_unraid_bundle.pem`.
+- Optionally enables `use_ssl yes` and reloads the WebGUI after install.
+- Adds a managed cron entry for auto-renewal when enabled.
+
+## Defaults for this repo
+
+- ACME directory: `https://step-ca.lan:9000/acme/acme/directory`
+- Root bundle: `https://step-ca.lan:9000/roots.pem`
+
+Those defaults come from [docker-compose.yml](/mnt/user/docker_compose/ca_server_docker/docker-compose.yml).
+
+## Important Unraid behavior
+
+- The certificate must match the active Unraid `server name` plus `Local TLD`, or a wildcard for that Local TLD.
+- Unraid expects the custom bundle file name to be `/boot/config/ssl/certs/[servername]_unraid_bundle.pem`.
+- The bundle installed by this plugin contains the full certificate chain followed by the private key.
+- Browsers and other clients still need to trust your Step CA root certificate separately.
+
+## Files
+
+- `src/step-ca-webgui-acme.page`: Unraid settings page
+- `src/scripts/step-ca-webgui-acme.sh`: ACME, install, validation, and cron logic
+- `build-plugin.sh`: Generates the distributable `.plg`
+- `step-ca-webgui-acme.plg`: Generated plugin file
+
+## Build
+
+From this repo:
+
+```bash
+cd /mnt/user/docker_compose/ca_server_docker/unraid-plugin
+chmod +x build-plugin.sh
+./build-plugin.sh
+```
+
+If you plan to publish the plugin, set these first so the generated metadata points at your repo:
+
+```bash
+export PLUGIN_URL="https://raw.githubusercontent.com/<owner>/<repo>/main/unraid-plugin/step-ca-webgui-acme.plg"
+export SUPPORT_URL="https://github.com/<owner>/<repo>"
+./build-plugin.sh
+```
+
+## Install on Unraid
+
+1. Copy `step-ca-webgui-acme.plg` to a location Unraid can read, or publish it at a raw URL.
+2. Install it from the Unraid Plugins page.
+3. Open `Settings -> Step CA WebGUI ACME`.
+4. Confirm the ACME directory URL and root bundle URL.
+5. Save, then run `Save and Issue Cert`.
+
+## Challenge modes
+
+- `standalone`: Uses HTTP-01 on port `80`
+- `alpn`: Uses TLS-ALPN-01 on port `443`
+
+Both modes are set up to temporarily stop the Unraid WebGUI during issuance so the ACME client can bind the needed port.
+]]></INLINE>
+</FILE>
+
+<FILE Name="/usr/local/emhttp/plugins/step-ca-webgui-acme/scripts/step-ca-webgui-acme.sh">
+<INLINE><![CDATA[
+#!/bin/bash
+
+set -euo pipefail
+
+PLUGIN_NAME="step-ca-webgui-acme"
+PLUGIN_DIR="/usr/local/emhttp/plugins/${PLUGIN_NAME}"
+CONFIG_DIR="/boot/config/plugins/${PLUGIN_NAME}"
+CONFIG_FILE="${CONFIG_DIR}/${PLUGIN_NAME}.cfg"
+STATE_FILE="${CONFIG_DIR}/${PLUGIN_NAME}.state"
+LOG_DIR="${CONFIG_DIR}/logs"
+LOG_FILE="${LOG_DIR}/issue.log"
+ACME_HOME="${CONFIG_DIR}/acme.sh"
+CERT_WORK_DIR="${CONFIG_DIR}/certs"
+ROOT_CA_FILE="${CONFIG_DIR}/root-ca.pem"
+IDENT_CFG="/boot/config/ident.cfg"
+SSL_CERT_DIR="/boot/config/ssl/certs"
+NGINX_RC="/etc/rc.d/rc.nginx"
+LOCK_DIR="${CONFIG_DIR}/.lock"
+CRON_MARKER="# ${PLUGIN_NAME} managed job"
+ACME_SH_VERSION="${ACME_SH_VERSION:-3.1.1}"
+ACME_SH_ARCHIVE_URL="${ACME_SH_ARCHIVE_URL:-https://github.com/acmesh-official/acme.sh/archive/refs/tags/${ACME_SH_VERSION}.tar.gz}"
+
+ACME_DIRECTORY_URL_DEFAULT="https://step-ca.lan:9000/acme/acme/directory"
+ROOT_CERT_URL_DEFAULT="https://step-ca.lan:9000/roots.pem"
+CONTACT_EMAIL_DEFAULT=""
+DOMAIN_OVERRIDE_DEFAULT=""
+SERVER_NAME_OVERRIDE_DEFAULT=""
+CHALLENGE_MODE_DEFAULT="standalone"
+ACME_INSECURE_BOOTSTRAP_DEFAULT="yes"
+AUTO_RENEW_DEFAULT="yes"
+RENEW_CRON_DEFAULT="17 3 * * *"
+ENABLE_SSL_AFTER_ISSUE_DEFAULT="yes"
+STOP_WEBSERVER_FOR_CHALLENGE_DEFAULT="yes"
+MIN_FORCE_RENEW_SECONDS=86400
+MAX_FORCE_RENEW_SECONDS=2592000
+
+WEBGUI_WAS_STOPPED=0
+RESOLVED_DOMAIN=""
+TARGET_SERVER_NAME=""
+TARGET_BUNDLE=""
+CERT_NOT_AFTER=""
+
+timestamp() {
+  date '+%Y-%m-%d %H:%M:%S'
+}
+
+log() {
+  echo "[$(timestamp)] $*"
+}
+
+escape_ini() {
+  printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
+}
+
+write_state() {
+  local result="${1:-unknown}"
+  local message="${2:-}"
+  mkdir -p "${CONFIG_DIR}"
+  cat > "${STATE_FILE}" <<EOF
+LAST_RUN_AT="$(date -Iseconds)"
+LAST_RESULT="$(escape_ini "${result}")"
+LAST_MESSAGE="$(escape_ini "${message}")"
+RESOLVED_DOMAIN="$(escape_ini "${RESOLVED_DOMAIN}")"
+TARGET_SERVER_NAME="$(escape_ini "${TARGET_SERVER_NAME}")"
+TARGET_BUNDLE="$(escape_ini "${TARGET_BUNDLE}")"
+CERT_NOT_AFTER="$(escape_ini "${CERT_NOT_AFTER}")"
+EOF
+}
+
+fail() {
+  local message="${1:-Unknown error}"
+  write_state "error" "${message}"
+  log "ERROR: ${message}"
+  exit 1
+}
+
+ensure_dirs() {
+  mkdir -p "${CONFIG_DIR}" "${LOG_DIR}" "${CERT_WORK_DIR}" "${SSL_CERT_DIR}"
+  touch "${LOG_FILE}"
+}
+
+write_default_config() {
+  umask 077
+  cat > "${CONFIG_FILE}" <<EOF
+ACME_DIRECTORY_URL="${ACME_DIRECTORY_URL_DEFAULT}"
+ROOT_CERT_URL="${ROOT_CERT_URL_DEFAULT}"
+CONTACT_EMAIL="${CONTACT_EMAIL_DEFAULT}"
+DOMAIN_OVERRIDE="${DOMAIN_OVERRIDE_DEFAULT}"
+SERVER_NAME_OVERRIDE="${SERVER_NAME_OVERRIDE_DEFAULT}"
+CHALLENGE_MODE="${CHALLENGE_MODE_DEFAULT}"
+ACME_INSECURE_BOOTSTRAP="${ACME_INSECURE_BOOTSTRAP_DEFAULT}"
+AUTO_RENEW="${AUTO_RENEW_DEFAULT}"
+RENEW_CRON="${RENEW_CRON_DEFAULT}"
+ENABLE_SSL_AFTER_ISSUE="${ENABLE_SSL_AFTER_ISSUE_DEFAULT}"
+STOP_WEBSERVER_FOR_CHALLENGE="${STOP_WEBSERVER_FOR_CHALLENGE_DEFAULT}"
+EOF
+}
+
+load_config() {
+  ensure_dirs
+
+  if [ ! -f "${CONFIG_FILE}" ]; then
+    write_default_config
+  fi
+
+  # shellcheck disable=SC1090
+  . "${CONFIG_FILE}"
+
+  ACME_DIRECTORY_URL="${ACME_DIRECTORY_URL:-${ACME_DIRECTORY_URL_DEFAULT}}"
+  ROOT_CERT_URL="${ROOT_CERT_URL:-${ROOT_CERT_URL_DEFAULT}}"
+  CONTACT_EMAIL="${CONTACT_EMAIL:-${CONTACT_EMAIL_DEFAULT}}"
+  DOMAIN_OVERRIDE="${DOMAIN_OVERRIDE:-${DOMAIN_OVERRIDE_DEFAULT}}"
+  SERVER_NAME_OVERRIDE="${SERVER_NAME_OVERRIDE:-${SERVER_NAME_OVERRIDE_DEFAULT}}"
+  CHALLENGE_MODE="${CHALLENGE_MODE:-${CHALLENGE_MODE_DEFAULT}}"
+  ACME_INSECURE_BOOTSTRAP="${ACME_INSECURE_BOOTSTRAP:-${ACME_INSECURE_BOOTSTRAP_DEFAULT}}"
+  AUTO_RENEW="${AUTO_RENEW:-${AUTO_RENEW_DEFAULT}}"
+  RENEW_CRON="${RENEW_CRON:-${RENEW_CRON_DEFAULT}}"
+  ENABLE_SSL_AFTER_ISSUE="${ENABLE_SSL_AFTER_ISSUE:-${ENABLE_SSL_AFTER_ISSUE_DEFAULT}}"
+  STOP_WEBSERVER_FOR_CHALLENGE="${STOP_WEBSERVER_FOR_CHALLENGE:-${STOP_WEBSERVER_FOR_CHALLENGE_DEFAULT}}"
+}
+
+require_binary() {
+  local name="$1"
+  command -v "${name}" >/dev/null 2>&1 || fail "Required command '${name}' is not available."
+}
+
+load_ident_config() {
+  local ident_name=""
+  local ident_local_tld=""
+
+  if [ -f "${IDENT_CFG}" ]; then
+    while IFS='=' read -r raw_key raw_value; do
+      local key="${raw_key// /}"
+      local value="${raw_value:-}"
+      key="${key//$'\r'/}"
+      value="${value//$'\r'/}"
+      value="${value%\"}"
+      value="${value#\"}"
+
+      case "${key}" in
+        NAME)
+          ident_name="${value}"
+          ;;
+        LOCAL_TLD)
+          ident_local_tld="${value}"
+          ;;
+      esac
+    done < "${IDENT_CFG}"
+  fi
+
+  IDENT_NAME="${ident_name}"
+  IDENT_LOCAL_TLD="${ident_local_tld}"
+}
+
+sanitize_server_name() {
+  printf '%s' "$1" | sed 's/[^A-Za-z0-9._-]/-/g; s/^-*//; s/-*$//'
+}
+
+resolve_domain() {
+  load_ident_config
+
+  if [ -n "${DOMAIN_OVERRIDE}" ]; then
+    RESOLVED_DOMAIN="${DOMAIN_OVERRIDE}"
+  else
+    local server_name="${SERVER_NAME_OVERRIDE:-${IDENT_NAME:-}}"
+    local local_tld="${IDENT_LOCAL_TLD:-}"
+
+    [ -n "${server_name}" ] || fail "No server name found. Set 'Server name override' or configure Settings -> Identification in Unraid."
+    [ -n "${local_tld}" ] || fail "No Local TLD found. Set it in Unraid Management Access or use 'Domain override'."
+    RESOLVED_DOMAIN="${server_name}.${local_tld}"
+  fi
+
+  if [ -n "${SERVER_NAME_OVERRIDE}" ]; then
+    TARGET_SERVER_NAME="${SERVER_NAME_OVERRIDE}"
+  elif [ -n "${IDENT_NAME:-}" ]; then
+    TARGET_SERVER_NAME="${IDENT_NAME}"
+  else
+    TARGET_SERVER_NAME="${RESOLVED_DOMAIN%%.*}"
+  fi
+
+  TARGET_SERVER_NAME="$(sanitize_server_name "${TARGET_SERVER_NAME}")"
+  [ -n "${TARGET_SERVER_NAME}" ] || fail "Unable to determine the target Unraid server name."
+  TARGET_BUNDLE="${SSL_CERT_DIR}/${TARGET_SERVER_NAME}_unraid_bundle.pem"
+}
+
+derive_root_url() {
+  if [ -n "${ROOT_CERT_URL}" ]; then
+    printf '%s\n' "${ROOT_CERT_URL}"
+    return
+  fi
+
+  printf '%s\n' "${ACME_DIRECTORY_URL}" | sed -E 's#/acme/.*$#/roots.pem#'
+}
+
+fetch_root_ca() {
+  local root_url
+  local curl_args=(
+    --fail
+    --silent
+    --show-error
+    --location
+  )
+
+  root_url="$(derive_root_url)"
+  [ -n "${root_url}" ] || fail "Unable to determine the Step CA root certificate URL."
+
+  if [ "${ACME_INSECURE_BOOTSTRAP}" = "yes" ]; then
+    curl_args+=(-k)
+  fi
+
+  log "Downloading Step CA root bundle from ${root_url}"
+  curl "${curl_args[@]}" "${root_url}" -o "${ROOT_CA_FILE}.tmp"
+
+  grep -q "BEGIN CERTIFICATE" "${ROOT_CA_FILE}.tmp" || fail "Downloaded root bundle does not look like PEM data."
+  mv "${ROOT_CA_FILE}.tmp" "${ROOT_CA_FILE}"
+}
+
+acme_sh() {
+  sh "${ACME_HOME}/acme.sh" --home "${ACME_HOME}" --config-home "${ACME_HOME}" "$@"
+}
+
+ensure_acme_client() {
+  local tmp_dir source_dir
+
+  if [ -f "${ACME_HOME}/acme.sh" ]; then
+    return
+  fi
+
+  require_binary curl
+  require_binary tar
+
+  tmp_dir="$(mktemp -d)"
+  trap 'rm -rf "${tmp_dir}"' RETURN
+
+  log "Installing acme.sh ${ACME_SH_VERSION} into ${ACME_HOME}"
+  curl --fail --silent --show-error --location "${ACME_SH_ARCHIVE_URL}" | tar -xz -C "${tmp_dir}"
+
+  source_dir="${tmp_dir}/acme.sh-${ACME_SH_VERSION}"
+  [ -d "${source_dir}" ] || source_dir="${tmp_dir}/acme.sh-master"
+  [ -d "${source_dir}" ] || fail "Failed to locate extracted acme.sh files after download."
+
+  mkdir -p "${ACME_HOME}"
+  cp -a "${source_dir}/." "${ACME_HOME}/"
+
+  chmod +x "${ACME_HOME}/acme.sh"
+  rm -rf "${tmp_dir}"
+  trap - RETURN
+}
+
+certificate_date_epoch() {
+  local certificate_file="$1"
+  local date_flag="$2"
+  local raw_date=""
+
+  raw_date="$(openssl x509 -in "${certificate_file}" -noout "${date_flag}" 2>/dev/null | cut -d= -f2-)"
+  [ -n "${raw_date}" ] || return 1
+  date -d "${raw_date}" +%s
+}
+
+force_renew_threshold_seconds() {
+  local certificate_file="$1"
+  local start_epoch end_epoch lifetime threshold
+
+  start_epoch="$(certificate_date_epoch "${certificate_file}" -startdate)" || return 1
+  end_epoch="$(certificate_date_epoch "${certificate_file}" -enddate)" || return 1
+  [ "${end_epoch}" -gt "${start_epoch}" ] || return 1
+
+  lifetime=$((end_epoch - start_epoch))
+  threshold=$((lifetime / 3))
+
+  if [ "${threshold}" -lt "${MIN_FORCE_RENEW_SECONDS}" ]; then
+    threshold="${MIN_FORCE_RENEW_SECONDS}"
+  fi
+
+  if [ "${threshold}" -gt "${MAX_FORCE_RENEW_SECONDS}" ]; then
+    threshold="${MAX_FORCE_RENEW_SECONDS}"
+  fi
+
+  printf '%s\n' "${threshold}"
+}
+
+should_force_renew() {
+  local certificate_file="${TARGET_BUNDLE}"
+  local now_epoch end_epoch remaining_seconds threshold_seconds
+
+  if [ ! -f "${certificate_file}" ]; then
+    log "Forcing renewal because the installed Unraid bundle does not exist yet."
+    return 0
+  fi
+
+  if ! openssl x509 -in "${certificate_file}" -noout >/dev/null 2>&1; then
+    log "Forcing renewal because the installed Unraid bundle is not a valid certificate."
+    return 0
+  fi
+
+  now_epoch="$(date +%s)"
+  end_epoch="$(certificate_date_epoch "${certificate_file}" -enddate)" || {
+    log "Forcing renewal because the installed Unraid bundle expiry could not be read."
+    return 0
+  }
+
+  remaining_seconds=$((end_epoch - now_epoch))
+  if [ "${remaining_seconds}" -le 0 ]; then
+    log "Forcing renewal because the installed Unraid bundle is already expired."
+    return 0
+  fi
+
+  threshold_seconds="$(force_renew_threshold_seconds "${certificate_file}")" || threshold_seconds="${MIN_FORCE_RENEW_SECONDS}"
+  if [ "${remaining_seconds}" -le "${threshold_seconds}" ]; then
+    log "Forcing renewal because the installed Unraid bundle expires within ${threshold_seconds} seconds."
+    return 0
+  fi
+
+  return 1
+}
+
+with_lock() {
+  if ! mkdir "${LOCK_DIR}" 2>/dev/null; then
+    fail "Another ${PLUGIN_NAME} action is already running."
+  fi
+
+  trap 'rm -rf "${LOCK_DIR}"' EXIT
+}
+
+stop_webgui_if_needed() {
+  if [ "${STOP_WEBSERVER_FOR_CHALLENGE}" != "yes" ]; then
+    return
+  fi
+
+  if [ ! -x "${NGINX_RC}" ]; then
+    log "Skipping WebGUI stop because ${NGINX_RC} is unavailable."
+    return
+  fi
+
+  log "Stopping Unraid WebGUI for ACME ${CHALLENGE_MODE} validation"
+  "${NGINX_RC}" stop >/dev/null 2>&1 || true
+  WEBGUI_WAS_STOPPED=1
+}
+
+start_webgui_if_needed() {
+  if [ "${WEBGUI_WAS_STOPPED}" -ne 1 ]; then
+    return
+  fi
+
+  if [ -x "${NGINX_RC}" ]; then
+    log "Starting Unraid WebGUI"
+    "${NGINX_RC}" start >/dev/null 2>&1 || true
+  fi
+}
+
+reload_webgui() {
+  if [ "${ENABLE_SSL_AFTER_ISSUE}" = "yes" ] && command -v use_ssl >/dev/null 2>&1; then
+    log "Ensuring Unraid SSL is enabled"
+    use_ssl yes >/dev/null 2>&1 || true
+  fi
+
+  if [ -x "${NGINX_RC}" ]; then
+    log "Reloading Unraid WebGUI"
+    "${NGINX_RC}" reload >/dev/null 2>&1 || "${NGINX_RC}" restart >/dev/null 2>&1 || true
+  fi
+}
+
+validate_bundle() {
+  require_binary openssl
+
+  [ -f "${TARGET_BUNDLE}" ] || fail "Expected bundle was not created at ${TARGET_BUNDLE}."
+  openssl x509 -in "${TARGET_BUNDLE}" -noout >/dev/null 2>&1 || fail "Installed bundle does not begin with a valid certificate."
+  openssl x509 -in "${TARGET_BUNDLE}" -noout -checkhost "${RESOLVED_DOMAIN}" >/dev/null 2>&1 || fail "Installed certificate does not match ${RESOLVED_DOMAIN}."
+  CERT_NOT_AFTER="$(openssl x509 -in "${TARGET_BUNDLE}" -noout -enddate | cut -d= -f2-)"
+}
+
+update_cron() {
+  local tmp_file cron_line
+
+  tmp_file="$(mktemp)"
+  crontab -l 2>/dev/null | grep -F -v "${CRON_MARKER}" > "${tmp_file}" || true
+
+  if [ "${AUTO_RENEW}" = "yes" ]; then
+    cron_line="${RENEW_CRON} /usr/local/emhttp/plugins/${PLUGIN_NAME}/scripts/${PLUGIN_NAME}.sh renew > /dev/null 2>&1 ${CRON_MARKER}"
+    printf '%s\n' "${cron_line}" >> "${tmp_file}"
+  fi
+
+  crontab "${tmp_file}"
+  rm -f "${tmp_file}"
+}
+
+install_bundle_files() {
+  local domain_dir="${CERT_WORK_DIR}/${RESOLVED_DOMAIN}"
+  local cert_file="${domain_dir}/cert.pem"
+  local key_file="${domain_dir}/private.key"
+  local fullchain_file="${domain_dir}/fullchain.pem"
+  local ca_file="${domain_dir}/ca.pem"
+  local tmp_bundle="${TARGET_BUNDLE}.tmp"
+
+  mkdir -p "${domain_dir}"
+
+  acme_sh \
+    --install-cert -d "${RESOLVED_DOMAIN}" \
+    --cert-file "${cert_file}" \
+    --key-file "${key_file}" \
+    --fullchain-file "${fullchain_file}" \
+    --ca-file "${ca_file}" >/dev/null
+
+  [ -f "${fullchain_file}" ] || fail "acme.sh did not produce a fullchain file."
+  [ -f "${key_file}" ] || fail "acme.sh did not produce a private key file."
+
+  umask 077
+  cat "${fullchain_file}" "${key_file}" > "${tmp_bundle}"
+  mv "${tmp_bundle}" "${TARGET_BUNDLE}"
+}
+
+run_acme_issue() {
+  local acme_cmd=(
+    acme_sh
+    --server "${ACME_DIRECTORY_URL}"
+    --ca-bundle "${ROOT_CA_FILE}"
+    --keylength 2048
+    -d "${RESOLVED_DOMAIN}"
+  )
+
+  if [ "${CHALLENGE_MODE}" = "alpn" ]; then
+    acme_cmd+=(--alpn)
+  else
+    acme_cmd+=(--standalone)
+  fi
+
+  log "Requesting certificate for ${RESOLVED_DOMAIN} via ${ACME_DIRECTORY_URL}"
+  "${acme_cmd[@]}" --issue --force
+}
+
+run_acme_renew() {
+  local acme_cmd=(
+    acme_sh
+    --server "${ACME_DIRECTORY_URL}"
+    --ca-bundle "${ROOT_CA_FILE}"
+    --keylength 2048
+    -d "${RESOLVED_DOMAIN}"
+  )
+
+  if [ "${CHALLENGE_MODE}" = "alpn" ]; then
+    acme_cmd+=(--alpn)
+  else
+    acme_cmd+=(--standalone)
+  fi
+
+  if [ -d "${ACME_HOME}/${RESOLVED_DOMAIN}" ]; then
+    if should_force_renew; then
+      log "Renewing certificate for ${RESOLVED_DOMAIN} with --force"
+      "${acme_cmd[@]}" --renew --force
+    else
+      log "Renewing certificate for ${RESOLVED_DOMAIN}"
+      "${acme_cmd[@]}" --renew
+    fi
+  else
+    log "No existing ACME material found for ${RESOLVED_DOMAIN}; issuing a fresh certificate instead"
+    "${acme_cmd[@]}" --issue --force
+  fi
+}
+
+run_certificate_action() {
+  local mode="$1"
+
+  require_binary curl
+  require_binary openssl
+
+  ensure_dirs
+  load_config
+  resolve_domain
+  fetch_root_ca
+  ensure_acme_client
+
+  if [ "${CHALLENGE_MODE}" = "standalone" ] || [ "${CHALLENGE_MODE}" = "alpn" ]; then
+    command -v socat >/dev/null 2>&1 || fail "acme.sh requires 'socat' for ${CHALLENGE_MODE} challenge mode, but socat is not installed on this Unraid server."
+  fi
+  with_lock
+
+  if [ "${CHALLENGE_MODE}" != "standalone" ] && [ "${CHALLENGE_MODE}" != "alpn" ]; then
+    fail "Unsupported challenge mode '${CHALLENGE_MODE}'. Use 'standalone' or 'alpn'."
+  fi
+
+  trap 'start_webgui_if_needed; rm -rf "${LOCK_DIR}"' EXIT
+  stop_webgui_if_needed
+
+  if [ "${mode}" = "renew" ]; then
+    run_acme_renew
+  else
+    run_acme_issue
+  fi
+
+  install_bundle_files
+  validate_bundle
+  reload_webgui
+
+  write_state "success" "Installed certificate for ${RESOLVED_DOMAIN}; expires ${CERT_NOT_AFTER}."
+  log "Certificate installed at ${TARGET_BUNDLE}"
+  log "Certificate expiry: ${CERT_NOT_AFTER}"
+}
+
+show_status() {
+  load_config
+  resolve_domain
+
+  printf 'Resolved domain: %s\n' "${RESOLVED_DOMAIN}"
+  printf 'Target bundle: %s\n' "${TARGET_BUNDLE}"
+  printf 'ACME directory: %s\n' "${ACME_DIRECTORY_URL}"
+  printf 'Challenge mode: %s\n' "${CHALLENGE_MODE}"
+
+  if [ -f "${TARGET_BUNDLE}" ]; then
+    printf 'Installed certificate:\n'
+    openssl x509 -in "${TARGET_BUNDLE}" -noout -subject -issuer -enddate
+  else
+    printf 'Installed certificate: none\n'
+  fi
+}
+
+configure_plugin() {
+  ensure_dirs
+  load_config
+  update_cron
+  write_state "success" "Configuration saved."
+  log "Configuration loaded and cron updated"
+}
+
+main() {
+  local command="${1:-status}"
+
+  ensure_dirs
+  exec >> >(tee -a "${LOG_FILE}") 2>&1
+  log "Starting ${PLUGIN_NAME} action: ${command}"
+
+  case "${command}" in
+    configure)
+      configure_plugin
+      ;;
+    issue)
+      run_certificate_action issue
+      ;;
+    renew)
+      run_certificate_action renew
+      ;;
+    status)
+      show_status
+      ;;
+    *)
+      fail "Unknown command '${command}'. Valid commands: configure, issue, renew, status."
+      ;;
+  esac
+}
+
+main "$@"
+]]></INLINE>
+</FILE>
+
+<FILE Name="/usr/local/emhttp/plugins/step-ca-webgui-acme/step-ca-webgui-acme.page">
+<INLINE><![CDATA[
+Menu="Utilities"
+Type="xmenu"
+Icon="icon-key"
+Title="Step CA WebGUI ACME"
+---
+<?php
+$plugin = 'step-ca-webgui-acme';
+$configDir = "/boot/config/plugins/$plugin";
+$configFile = "$configDir/$plugin.cfg";
+$stateFile = "$configDir/$plugin.state";
+$logFile = "$configDir/logs/issue.log";
+$script = "/usr/local/emhttp/plugins/$plugin/scripts/$plugin.sh";
+$identFile = '/boot/config/ident.cfg';
+
+$defaults = [
+  'ACME_DIRECTORY_URL' => 'https://step-ca.lan:9000/acme/acme/directory',
+  'ROOT_CERT_URL' => 'https://step-ca.lan:9000/roots.pem',
+  'CONTACT_EMAIL' => '',
+  'DOMAIN_OVERRIDE' => '',
+  'SERVER_NAME_OVERRIDE' => '',
+  'CHALLENGE_MODE' => 'standalone',
+  'ACME_INSECURE_BOOTSTRAP' => 'yes',
+  'AUTO_RENEW' => 'yes',
+  'RENEW_CRON' => '17 3 * * *',
+  'ENABLE_SSL_AFTER_ISSUE' => 'yes',
+  'STOP_WEBSERVER_FOR_CHALLENGE' => 'yes',
+];
+
+function read_ini_or_defaults($path, array $defaults): array {
+  if (!is_file($path)) {
+    return $defaults;
+  }
+
+  $parsed = parse_ini_file($path, false, INI_SCANNER_RAW);
+  if (!is_array($parsed)) {
+    return $defaults;
+  }
+
+  return array_merge($defaults, $parsed);
+}
+
+function write_ini_file(string $path, array $values): void {
+  $lines = [];
+  foreach ($values as $key => $value) {
+    $escaped = addcslashes((string) $value, "\\\"");
+    $lines[] = sprintf('%s="%s"', $key, $escaped);
+  }
+
+  if (!is_dir(dirname($path))) {
+    mkdir(dirname($path), 0700, true);
+  }
+
+  file_put_contents($path, implode(PHP_EOL, $lines) . PHP_EOL);
+}
+
+function h($value): string {
+  return htmlspecialchars((string) $value, ENT_QUOTES, 'UTF-8');
+}
+
+function post_value(string $key, array $defaults): string {
+  return isset($_POST[$key]) ? trim((string) $_POST[$key]) : (string) ($defaults[$key] ?? '');
+}
+
+function yes_no_field(string $name, array $config): string {
+  $current = $config[$name] ?? 'no';
+  $yes = $current === 'yes' ? 'selected' : '';
+  $no = $current === 'no' ? 'selected' : '';
+  return "<select name=\"" . h($name) . "\"><option value=\"yes\" $yes>Yes</option><option value=\"no\" $no>No</option></select>";
+}
+
+$ident = is_file($identFile) ? (parse_ini_file($identFile, false, INI_SCANNER_RAW) ?: []) : [];
+$config = read_ini_or_defaults($configFile, $defaults);
+$state = read_ini_or_defaults($stateFile, [
+  'LAST_RUN_AT' => '',
+  'LAST_RESULT' => '',
+  'LAST_MESSAGE' => '',
+  'RESOLVED_DOMAIN' => '',
+  'TARGET_SERVER_NAME' => '',
+  'TARGET_BUNDLE' => '',
+  'CERT_NOT_AFTER' => '',
+]);
+
+$output = '';
+$messages = [];
+
+if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+  $config = [
+    'ACME_DIRECTORY_URL' => post_value('ACME_DIRECTORY_URL', $defaults),
+    'ROOT_CERT_URL' => post_value('ROOT_CERT_URL', $defaults),
+    'CONTACT_EMAIL' => post_value('CONTACT_EMAIL', $defaults),
+    'DOMAIN_OVERRIDE' => post_value('DOMAIN_OVERRIDE', $defaults),
+    'SERVER_NAME_OVERRIDE' => post_value('SERVER_NAME_OVERRIDE', $defaults),
+    'CHALLENGE_MODE' => in_array(post_value('CHALLENGE_MODE', $defaults), ['standalone', 'alpn'], true) ? post_value('CHALLENGE_MODE', $defaults) : 'standalone',
+    'ACME_INSECURE_BOOTSTRAP' => post_value('ACME_INSECURE_BOOTSTRAP', $defaults) === 'no' ? 'no' : 'yes',
+    'AUTO_RENEW' => post_value('AUTO_RENEW', $defaults) === 'no' ? 'no' : 'yes',
+    'RENEW_CRON' => post_value('RENEW_CRON', $defaults),
+    'ENABLE_SSL_AFTER_ISSUE' => post_value('ENABLE_SSL_AFTER_ISSUE', $defaults) === 'no' ? 'no' : 'yes',
+    'STOP_WEBSERVER_FOR_CHALLENGE' => post_value('STOP_WEBSERVER_FOR_CHALLENGE', $defaults) === 'no' ? 'no' : 'yes',
+  ];
+
+  write_ini_file($configFile, $config);
+  $messages[] = 'Configuration saved.';
+
+  if (is_executable($script)) {
+    $configureOutput = shell_exec(escapeshellcmd($script) . ' configure 2>&1');
+    if ($configureOutput) {
+      $output .= $configureOutput;
+    }
+
+    if (isset($_POST['action_issue'])) {
+      $output .= shell_exec(escapeshellcmd($script) . ' issue 2>&1');
+    } elseif (isset($_POST['action_renew'])) {
+      $output .= shell_exec(escapeshellcmd($script) . ' renew 2>&1');
+    } elseif (isset($_POST['action_status'])) {
+      $output .= shell_exec(escapeshellcmd($script) . ' status 2>&1');
+    }
+  } else {
+    $messages[] = "Helper script not found at $script";
+  }
+
+  $state = read_ini_or_defaults($stateFile, $state);
+}
+
+$serverName = trim($config['SERVER_NAME_OVERRIDE']) !== '' ? trim($config['SERVER_NAME_OVERRIDE']) : ($ident['NAME'] ?? '');
+$localTld = trim((string) ($ident['LOCAL_TLD'] ?? ''));
+$domainPreview = trim($config['DOMAIN_OVERRIDE']) !== '' ? trim($config['DOMAIN_OVERRIDE']) : (($serverName !== '' && $localTld !== '') ? $serverName . '.' . $localTld : '(configure Local TLD in Unraid or set Domain override)');
+$bundleServer = $serverName !== '' ? $serverName : ($state['TARGET_SERVER_NAME'] ?: explode('.', $domainPreview)[0]);
+$bundleServer = preg_replace('/[^A-Za-z0-9._-]+/', '-', (string) $bundleServer);
+$bundlePath = "/boot/config/ssl/certs/{$bundleServer}_unraid_bundle.pem";
+?>
+
+<style>
+  :root {
+    --step-ca-surface: var(--background-color);
+    --step-ca-surface-alt: var(--section-bg, var(--background-color));
+    --step-ca-text: var(--text-color);
+    --step-ca-text-muted: var(--alt-text-color, var(--text-color));
+    --step-ca-border: var(--border-color, rgba(127,127,127,0.35));
+    --step-ca-shadow: var(--small-shadow, 0 20px 60px rgba(0, 0, 0, 0.28));
+  }
+
+  .step-ca-grid {
+    width: 100%;
+    border-collapse: collapse;
+  }
+
+  .step-ca-grid td {
+    padding: 8px 10px;
+    vertical-align: top;
+  }
+
+  .step-ca-grid td:first-child {
+    width: 270px;
+    font-weight: 600;
+    color: var(--step-ca-text);
+  }
+
+  .step-ca-grid input,
+  .step-ca-grid select {
+    width: 100%;
+    max-width: 620px;
+  }
+
+  .step-ca-hidden-shell {
+    min-height: 1px;
+  }
+
+  .step-ca-actions {
+    display: flex;
+    gap: 10px;
+    flex-wrap: wrap;
+    margin-top: 16px;
+  }
+
+  .step-ca-note {
+    margin-top: 10px;
+    color: var(--step-ca-text-muted);
+  }
+
+  .step-ca-modal-backdrop {
+    position: fixed;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.45);
+    display: none;
+    align-items: center;
+    justify-content: center;
+    z-index: 2000;
+    padding: 24px;
+  }
+
+  .step-ca-modal-backdrop.is-open {
+    display: flex;
+  }
+
+  .step-ca-modal {
+    width: min(980px, 100%);
+    max-height: 90vh;
+    overflow: auto;
+    background: var(--step-ca-surface);
+    color: var(--step-ca-text);
+    border: 1px solid var(--step-ca-border);
+    border-radius: 12px;
+    box-shadow: var(--step-ca-shadow);
+    padding: 20px;
+  }
+
+  .step-ca-modal-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    margin-bottom: 12px;
+    padding-bottom: 10px;
+    border-bottom: 1px solid var(--step-ca-border);
+  }
+
+  .step-ca-modal-title {
+    font-size: 20px;
+    font-weight: 700;
+  }
+
+  .step-ca-close {
+    border: 0;
+    background: transparent;
+    font-size: 24px;
+    line-height: 1;
+    cursor: pointer;
+    color: var(--step-ca-text-muted);
+  }
+
+  .step-ca-result {
+    margin-top: 16px;
+    padding: 14px;
+    border: 1px solid var(--step-ca-border);
+    border-radius: 8px;
+    background: var(--step-ca-surface-alt);
+    color: var(--step-ca-text);
+  }
+
+  .step-ca-result pre {
+    white-space: pre-wrap;
+    word-break: break-word;
+    margin: 10px 0 0;
+    color: inherit;
+  }
+
+  .step-ca-processing {
+    position: fixed;
+    inset: 0;
+    display: none;
+    align-items: center;
+    justify-content: center;
+    z-index: 2100;
+    background: rgba(0, 0, 0, 0.42);
+    padding: 24px;
+  }
+
+  .step-ca-processing.is-open {
+    display: flex;
+  }
+
+  .step-ca-processing-card {
+    width: min(520px, 100%);
+    background: var(--step-ca-surface);
+    color: var(--step-ca-text);
+    border: 1px solid var(--step-ca-border);
+    border-radius: 12px;
+    box-shadow: var(--step-ca-shadow);
+    padding: 22px 24px;
+    text-align: center;
+  }
+
+  .step-ca-processing-spinner {
+    width: 34px;
+    height: 34px;
+    margin: 0 auto 14px;
+    border-radius: 50%;
+    border: 3px solid var(--step-ca-border);
+    border-top-color: var(--orange-800, #f15a2c);
+    animation: step-ca-spin 0.9s linear infinite;
+  }
+
+  .step-ca-processing-title {
+    font-size: 18px;
+    font-weight: 700;
+    margin-bottom: 8px;
+  }
+
+  .step-ca-processing-text {
+    color: var(--step-ca-text-muted);
+    line-height: 1.55;
+  }
+
+  @keyframes step-ca-spin {
+    to {
+      transform: rotate(360deg);
+    }
+  }
+</style>
+
+<div class="step-ca-hidden-shell"></div>
+
+<div class="step-ca-modal-backdrop" id="step-ca-modal-backdrop">
+  <div class="step-ca-modal" role="dialog" aria-modal="true" aria-labelledby="step-ca-modal-title">
+    <div class="step-ca-modal-header">
+      <div class="step-ca-modal-title" id="step-ca-modal-title">Step CA WebGUI ACME Settings</div>
+      <button type="button" class="step-ca-close" id="step-ca-close-modal" aria-label="Close">&times;</button>
+    </div>
+
+    <form method="POST" id="step-ca-form">
+      <table class="step-ca-grid">
+        <tr>
+          <td>ACME directory URL</td>
+          <td>
+            <input type="text" name="ACME_DIRECTORY_URL" value="<?= h($config['ACME_DIRECTORY_URL']) ?>">
+            <div class="step-ca-note">Default matches this repo's Step CA: <code>https://step-ca.lan:9000/acme/acme/directory</code></div>
+          </td>
+        </tr>
+        <tr>
+          <td>Root certificate URL</td>
+          <td>
+            <input type="text" name="ROOT_CERT_URL" value="<?= h($config['ROOT_CERT_URL']) ?>">
+            <div class="step-ca-note">Used to bootstrap trust for the ACME client. For this stack the default is <code>https://step-ca.lan:9000/roots.pem</code>.</div>
+          </td>
+        </tr>
+        <tr>
+          <td>ACME account email</td>
+          <td>
+            <input type="text" name="CONTACT_EMAIL" value="<?= h($config['CONTACT_EMAIL']) ?>">
+            <div class="step-ca-note">Optional, but helpful for ACME account registration metadata.</div>
+          </td>
+        </tr>
+        <tr>
+          <td>Domain override</td>
+          <td>
+            <input type="text" name="DOMAIN_OVERRIDE" value="<?= h($config['DOMAIN_OVERRIDE']) ?>">
+            <div class="step-ca-note">Leave blank to use <code>[server name].[local TLD]</code> from Unraid. Current preview: <code><?= h($domainPreview) ?></code></div>
+          </td>
+        </tr>
+        <tr>
+          <td>Server name override</td>
+          <td>
+            <input type="text" name="SERVER_NAME_OVERRIDE" value="<?= h($config['SERVER_NAME_OVERRIDE']) ?>">
+            <div class="step-ca-note">Only needed if the bundle filename should not use the current Unraid server name. Current target bundle: <code><?= h($bundlePath) ?></code></div>
+          </td>
+        </tr>
+        <tr>
+          <td>Challenge mode</td>
+          <td>
+            <select name="CHALLENGE_MODE">
+              <option value="standalone" <?= $config['CHALLENGE_MODE'] === 'standalone' ? 'selected' : '' ?>>HTTP-01 standalone on port 80</option>
+              <option value="alpn" <?= $config['CHALLENGE_MODE'] === 'alpn' ? 'selected' : '' ?>>TLS-ALPN-01 on port 443</option>
+            </select>
+            <div class="step-ca-note">Both modes temporarily stop the Unraid WebGUI if you leave that option enabled below.</div>
+          </td>
+        </tr>
+        <tr>
+          <td>Allow insecure root bootstrap</td>
+          <td>
+            <?= yes_no_field('ACME_INSECURE_BOOTSTRAP', $config) ?>
+            <div class="step-ca-note">When set to Yes, the plugin uses <code>curl -k</code> only while fetching the initial Step CA root bundle.</div>
+          </td>
+        </tr>
+        <tr>
+          <td>Auto renew</td>
+          <td>
+            <?= yes_no_field('AUTO_RENEW', $config) ?>
+            <div class="step-ca-note">Adds a managed root crontab entry that runs the renew action.</div>
+          </td>
+        </tr>
+        <tr>
+          <td>Renew cron schedule</td>
+          <td>
+            <input type="text" name="RENEW_CRON" value="<?= h($config['RENEW_CRON']) ?>">
+            <div class="step-ca-note">Standard five-field cron syntax. Default: <code>17 3 * * *</code></div>
+          </td>
+        </tr>
+        <tr>
+          <td>Enable SSL after install</td>
+          <td>
+            <?= yes_no_field('ENABLE_SSL_AFTER_ISSUE', $config) ?>
+            <div class="step-ca-note">Runs <code>use_ssl yes</code> after a successful install so Unraid serves the new custom certificate.</div>
+          </td>
+        </tr>
+        <tr>
+          <td>Stop WebGUI for challenge</td>
+          <td>
+            <?= yes_no_field('STOP_WEBSERVER_FOR_CHALLENGE', $config) ?>
+            <div class="step-ca-note">Recommended when using standalone or ALPN validation because the ACME client needs port 80 or 443.</div>
+          </td>
+        </tr>
+      </table>
+
+      <div class="step-ca-actions">
+        <button type="submit" name="action_save" class="btn">Save</button>
+        <button type="submit" name="action_issue" class="btn btn-primary">Save and Issue Cert</button>
+        <button type="submit" name="action_renew" class="btn">Save and Renew</button>
+        <button type="submit" name="action_status" class="btn">Save and Show Status</button>
+      </div>
+
+      <?php foreach ($messages as $message): ?>
+        <div class="notice" style="margin-top:16px;"><?= h($message) ?></div>
+      <?php endforeach; ?>
+
+      <?php if (trim($output) !== ''): ?>
+        <div class="step-ca-result">
+          <strong>Command output</strong>
+          <pre><?= h(trim($output)) ?></pre>
+        </div>
+      <?php endif; ?>
+    </form>
+  </div>
+</div>
+
+<div class="step-ca-processing" id="step-ca-processing" aria-live="polite">
+  <div class="step-ca-processing-card">
+    <div class="step-ca-processing-spinner"></div>
+    <div class="step-ca-processing-title">Working...</div>
+    <div class="step-ca-processing-text" id="step-ca-processing-text">
+      Please wait while the Step CA command finishes. The page will update automatically when the command returns.
+    </div>
+  </div>
+</div>
+
+<script>
+  (function () {
+    const backdrop = document.getElementById('step-ca-modal-backdrop');
+    const closeButton = document.getElementById('step-ca-close-modal');
+    const form = document.getElementById('step-ca-form');
+    const processing = document.getElementById('step-ca-processing');
+    const processingText = document.getElementById('step-ca-processing-text');
+
+    if (!backdrop || !closeButton || !form || !processing || !processingText) {
+      return;
+    }
+
+    const openModal = () => backdrop.classList.add('is-open');
+    const closeModal = () => {
+      backdrop.classList.remove('is-open');
+      if (window.history.length > 1) {
+        window.history.back();
+      } else {
+        window.location = '/Settings/Utilities';
+      }
+    };
+    const openProcessing = (message) => {
+      processingText.textContent = message;
+      processing.classList.add('is-open');
+    };
+    const closeProcessing = () => processing.classList.remove('is-open');
+
+    closeButton.addEventListener('click', closeModal);
+    backdrop.addEventListener('click', (event) => {
+      if (event.target === backdrop) {
+        closeModal();
+      }
+    });
+    document.addEventListener('keydown', (event) => {
+      if (event.key === 'Escape') {
+        closeModal();
+      }
+    });
+
+    form.addEventListener('submit', async (event) => {
+      event.preventDefault();
+
+      const submitter = event.submitter;
+      const submitName = submitter && submitter.name ? submitter.name : 'action_save';
+      const messages = {
+        action_save: 'Saving Step CA settings. Please wait...',
+        action_issue: 'Issuing the WebGUI certificate. This can take a little while. Please wait and do not refresh the page...',
+        action_renew: 'Renewing the WebGUI certificate. Please wait and do not refresh the page...',
+        action_status: 'Loading plugin status. Please wait...'
+      };
+
+      const formData = new FormData(form);
+      if (submitter && submitter.name) {
+        formData.set(submitter.name, submitter.value || '1');
+      } else {
+        formData.set(submitName, '1');
+      }
+
+      openProcessing(messages[submitName] || 'Working. Please wait...');
+
+      Array.from(form.elements).forEach((element) => {
+        element.disabled = true;
+      });
+
+      try {
+        const response = await fetch(window.location.href, {
+          method: 'POST',
+          body: formData,
+          credentials: 'same-origin',
+          headers: {
+            'X-Requested-With': 'XMLHttpRequest'
+          }
+        });
+
+        const html = await response.text();
+        document.open();
+        document.write(html);
+        document.close();
+      } catch (error) {
+        closeProcessing();
+        Array.from(form.elements).forEach((element) => {
+          element.disabled = false;
+        });
+        alert('The Step CA command did not complete cleanly. Please try again.');
+      }
+    });
+
+    openModal();
+  })();
+</script>
+]]></INLINE>
+</FILE>
+
+<FILE Run="/bin/bash">
+<INLINE><![CDATA[
+chmod +x "/usr/local/emhttp/plugins/step-ca-webgui-acme/scripts/step-ca-webgui-acme.sh"
+mkdir -p "/boot/config/plugins/step-ca-webgui-acme" "/boot/config/plugins/step-ca-webgui-acme/logs"
+"/usr/local/emhttp/plugins/step-ca-webgui-acme/scripts/step-ca-webgui-acme.sh" configure
+]]></INLINE>
+</FILE>
+
+<FILE Run="/bin/bash" Method="remove">
+<INLINE><![CDATA[
+if crontab -l 2>/dev/null | grep -F -q "# step-ca-webgui-acme managed job"; then
+  tmp_file="$(mktemp)"
+  crontab -l 2>/dev/null | grep -F -v "# step-ca-webgui-acme managed job" > "${tmp_file}" || true
+  crontab "${tmp_file}"
+  rm -f "${tmp_file}"
+fi
+rm -rf "/usr/local/emhttp/plugins/step-ca-webgui-acme"
+echo "step-ca-webgui-acme removed. Configuration in /boot/config/plugins/step-ca-webgui-acme was preserved."
+]]></INLINE>
+</FILE>
+
+</PLUGIN>

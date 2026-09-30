@@ -6,20 +6,27 @@ services:
       context: ./ca
       dockerfile: Dockerfile
     container_name: ca_authority
+    extra_hosts:
+      - "N5-Pro.local:192.168.1.30"
+    labels:
+      - "com.example.stack=ca_server"
+      - "com.docker.compose.project=ca_server_docker"
     environment:
       - STEPPATH=/home/step/certs
+      - STEP_CA_DNS_NAMES=localhost,step-ca.lan,192.168.1.30
+      - STEP_CA_URL=https://step-ca.lan:9000
       - CERT_DURATION=2160h
       - MAX_CERT_DURATION=8760h
       - CA_PASSWORD=${CA_PASSWORD}
     ports:
-      - "9000:9000"
+      - "192.168.1.30:9000:9000"
     volumes:
-      - ${VOLUMES_PATH}/ca_certs:/home/step/certs
-      - ${VOLUMES_PATH}/ca_config:/home/step/.step
+      - ca_certs:/home/step/certs
+      - ca_config:/home/step/.step
     networks:
       - ca_network
     healthcheck:
-      test: ["CMD", "step", "ca", "health"]
+      test: ["CMD", "curl", "-k", "https://localhost:9000/roots.pem"]
       interval: 30s
       timeout: 5s
       retries: 3
@@ -29,19 +36,29 @@ services:
       context: ./backend
       dockerfile: Dockerfile
     container_name: ca_backend
+    labels:
+      - "com.example.stack=ca_server"
+      - "com.docker.compose.project=ca_server_docker"
     environment:
       - NODE_ENV=production
-      - CA_URL=http://c${ADMIN_USERNAME}
+      - CA_URL=https://ca:9000
+      - CA_PASSWORD=${CA_PASSWORD}
+      - ADMIN_USERNAME=${ADMIN_USERNAME}
       - ADMIN_PASSWORD=${ADMIN_PASSWORD}
-      - ADMIN_PASSWORD=changeme
-    ports:
-      - "3001:3001"
+      - ACME_LOG_SOURCE_CONTAINER=ca_authority
+      - ACME_LOG_POLL_INTERVAL_MS=60000
+      - ACME_LOG_INITIAL_LOOKBACK_SECONDS=604800
+      - ACME_LOG_OVERLAP_SECONDS=10
     depends_on:
       ca:
         condition: service_healthy
     volumes:
       - ./backend:/app
       - /app/node_modules
+      # Mount CA certs/keys so backend can sign certificates locally
+      - ca_certs:/home/step/certs:ro
+      - backend_data:/data
+      - /var/run/docker.sock:/var/run/docker.sock:ro
     networks:
       - ca_network
 
@@ -50,15 +67,25 @@ services:
       context: ./frontend
       dockerfile: Dockerfile
     container_name: ca_frontend
-    environment:
-      - REACT_APP_API_URL=http://localhost:3001/api
-    ports:
-      - "3000:3000"
+    labels:
+      - "com.example.stack=ca_server"
+      - "com.docker.compose.project=ca_server_docker"
     depends_on:
       - backend
     networks:
       - ca_network
+      - npm_proxy
 
 networks:
   ca_network:
     driver: bridge
+  npm_proxy:
+    external: true
+
+volumes:
+  ca_certs:
+    driver: local
+  ca_config:
+    driver: local
+  backend_data:
+    driver: local

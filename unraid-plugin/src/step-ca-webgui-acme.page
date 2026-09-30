@@ -1,0 +1,514 @@
+Menu="Utilities"
+Type="xmenu"
+Icon="icon-key"
+Title="Step CA WebGUI ACME"
+---
+<?php
+$plugin = 'step-ca-webgui-acme';
+$configDir = "/boot/config/plugins/$plugin";
+$configFile = "$configDir/$plugin.cfg";
+$stateFile = "$configDir/$plugin.state";
+$logFile = "$configDir/logs/issue.log";
+$script = "/usr/local/emhttp/plugins/$plugin/scripts/$plugin.sh";
+$identFile = '/boot/config/ident.cfg';
+
+$defaults = [
+  'ACME_DIRECTORY_URL' => 'https://step-ca.lan:9000/acme/acme/directory',
+  'ROOT_CERT_URL' => 'https://step-ca.lan:9000/roots.pem',
+  'CONTACT_EMAIL' => '',
+  'DOMAIN_OVERRIDE' => '',
+  'SERVER_NAME_OVERRIDE' => '',
+  'CHALLENGE_MODE' => 'standalone',
+  'ACME_INSECURE_BOOTSTRAP' => 'yes',
+  'AUTO_RENEW' => 'yes',
+  'RENEW_CRON' => '17 3 * * *',
+  'ENABLE_SSL_AFTER_ISSUE' => 'yes',
+  'STOP_WEBSERVER_FOR_CHALLENGE' => 'yes',
+];
+
+function read_ini_or_defaults($path, array $defaults): array {
+  if (!is_file($path)) {
+    return $defaults;
+  }
+
+  $parsed = parse_ini_file($path, false, INI_SCANNER_RAW);
+  if (!is_array($parsed)) {
+    return $defaults;
+  }
+
+  return array_merge($defaults, $parsed);
+}
+
+function write_ini_file(string $path, array $values): void {
+  $lines = [];
+  foreach ($values as $key => $value) {
+    $escaped = addcslashes((string) $value, "\\\"");
+    $lines[] = sprintf('%s="%s"', $key, $escaped);
+  }
+
+  if (!is_dir(dirname($path))) {
+    mkdir(dirname($path), 0700, true);
+  }
+
+  file_put_contents($path, implode(PHP_EOL, $lines) . PHP_EOL);
+}
+
+function h($value): string {
+  return htmlspecialchars((string) $value, ENT_QUOTES, 'UTF-8');
+}
+
+function post_value(string $key, array $defaults): string {
+  return isset($_POST[$key]) ? trim((string) $_POST[$key]) : (string) ($defaults[$key] ?? '');
+}
+
+function yes_no_field(string $name, array $config): string {
+  $current = $config[$name] ?? 'no';
+  $yes = $current === 'yes' ? 'selected' : '';
+  $no = $current === 'no' ? 'selected' : '';
+  return "<select name=\"" . h($name) . "\"><option value=\"yes\" $yes>Yes</option><option value=\"no\" $no>No</option></select>";
+}
+
+$ident = is_file($identFile) ? (parse_ini_file($identFile, false, INI_SCANNER_RAW) ?: []) : [];
+$config = read_ini_or_defaults($configFile, $defaults);
+$state = read_ini_or_defaults($stateFile, [
+  'LAST_RUN_AT' => '',
+  'LAST_RESULT' => '',
+  'LAST_MESSAGE' => '',
+  'RESOLVED_DOMAIN' => '',
+  'TARGET_SERVER_NAME' => '',
+  'TARGET_BUNDLE' => '',
+  'CERT_NOT_AFTER' => '',
+]);
+
+$output = '';
+$messages = [];
+
+if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+  $config = [
+    'ACME_DIRECTORY_URL' => post_value('ACME_DIRECTORY_URL', $defaults),
+    'ROOT_CERT_URL' => post_value('ROOT_CERT_URL', $defaults),
+    'CONTACT_EMAIL' => post_value('CONTACT_EMAIL', $defaults),
+    'DOMAIN_OVERRIDE' => post_value('DOMAIN_OVERRIDE', $defaults),
+    'SERVER_NAME_OVERRIDE' => post_value('SERVER_NAME_OVERRIDE', $defaults),
+    'CHALLENGE_MODE' => in_array(post_value('CHALLENGE_MODE', $defaults), ['standalone', 'alpn'], true) ? post_value('CHALLENGE_MODE', $defaults) : 'standalone',
+    'ACME_INSECURE_BOOTSTRAP' => post_value('ACME_INSECURE_BOOTSTRAP', $defaults) === 'no' ? 'no' : 'yes',
+    'AUTO_RENEW' => post_value('AUTO_RENEW', $defaults) === 'no' ? 'no' : 'yes',
+    'RENEW_CRON' => post_value('RENEW_CRON', $defaults),
+    'ENABLE_SSL_AFTER_ISSUE' => post_value('ENABLE_SSL_AFTER_ISSUE', $defaults) === 'no' ? 'no' : 'yes',
+    'STOP_WEBSERVER_FOR_CHALLENGE' => post_value('STOP_WEBSERVER_FOR_CHALLENGE', $defaults) === 'no' ? 'no' : 'yes',
+  ];
+
+  write_ini_file($configFile, $config);
+  $messages[] = 'Configuration saved.';
+
+  if (is_executable($script)) {
+    $configureOutput = shell_exec(escapeshellcmd($script) . ' configure 2>&1');
+    if ($configureOutput) {
+      $output .= $configureOutput;
+    }
+
+    if (isset($_POST['action_issue'])) {
+      $output .= shell_exec(escapeshellcmd($script) . ' issue 2>&1');
+    } elseif (isset($_POST['action_renew'])) {
+      $output .= shell_exec(escapeshellcmd($script) . ' renew 2>&1');
+    } elseif (isset($_POST['action_status'])) {
+      $output .= shell_exec(escapeshellcmd($script) . ' status 2>&1');
+    }
+  } else {
+    $messages[] = "Helper script not found at $script";
+  }
+
+  $state = read_ini_or_defaults($stateFile, $state);
+}
+
+$serverName = trim($config['SERVER_NAME_OVERRIDE']) !== '' ? trim($config['SERVER_NAME_OVERRIDE']) : ($ident['NAME'] ?? '');
+$localTld = trim((string) ($ident['LOCAL_TLD'] ?? ''));
+$domainPreview = trim($config['DOMAIN_OVERRIDE']) !== '' ? trim($config['DOMAIN_OVERRIDE']) : (($serverName !== '' && $localTld !== '') ? $serverName . '.' . $localTld : '(configure Local TLD in Unraid or set Domain override)');
+$bundleServer = $serverName !== '' ? $serverName : ($state['TARGET_SERVER_NAME'] ?: explode('.', $domainPreview)[0]);
+$bundleServer = preg_replace('/[^A-Za-z0-9._-]+/', '-', (string) $bundleServer);
+$bundlePath = "/boot/config/ssl/certs/{$bundleServer}_unraid_bundle.pem";
+?>
+
+<style>
+  :root {
+    --step-ca-surface: var(--background-color);
+    --step-ca-surface-alt: var(--section-bg, var(--background-color));
+    --step-ca-text: var(--text-color);
+    --step-ca-text-muted: var(--alt-text-color, var(--text-color));
+    --step-ca-border: var(--border-color, rgba(127,127,127,0.35));
+    --step-ca-shadow: var(--small-shadow, 0 20px 60px rgba(0, 0, 0, 0.28));
+  }
+
+  .step-ca-grid {
+    width: 100%;
+    border-collapse: collapse;
+  }
+
+  .step-ca-grid td {
+    padding: 8px 10px;
+    vertical-align: top;
+  }
+
+  .step-ca-grid td:first-child {
+    width: 270px;
+    font-weight: 600;
+    color: var(--step-ca-text);
+  }
+
+  .step-ca-grid input,
+  .step-ca-grid select {
+    width: 100%;
+    max-width: 620px;
+  }
+
+  .step-ca-hidden-shell {
+    min-height: 1px;
+  }
+
+  .step-ca-actions {
+    display: flex;
+    gap: 10px;
+    flex-wrap: wrap;
+    margin-top: 16px;
+  }
+
+  .step-ca-note {
+    margin-top: 10px;
+    color: var(--step-ca-text-muted);
+  }
+
+  .step-ca-modal-backdrop {
+    position: fixed;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.45);
+    display: none;
+    align-items: center;
+    justify-content: center;
+    z-index: 2000;
+    padding: 24px;
+  }
+
+  .step-ca-modal-backdrop.is-open {
+    display: flex;
+  }
+
+  .step-ca-modal {
+    width: min(980px, 100%);
+    max-height: 90vh;
+    overflow: auto;
+    background: var(--step-ca-surface);
+    color: var(--step-ca-text);
+    border: 1px solid var(--step-ca-border);
+    border-radius: 12px;
+    box-shadow: var(--step-ca-shadow);
+    padding: 20px;
+  }
+
+  .step-ca-modal-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    margin-bottom: 12px;
+    padding-bottom: 10px;
+    border-bottom: 1px solid var(--step-ca-border);
+  }
+
+  .step-ca-modal-title {
+    font-size: 20px;
+    font-weight: 700;
+  }
+
+  .step-ca-close {
+    border: 0;
+    background: transparent;
+    font-size: 24px;
+    line-height: 1;
+    cursor: pointer;
+    color: var(--step-ca-text-muted);
+  }
+
+  .step-ca-result {
+    margin-top: 16px;
+    padding: 14px;
+    border: 1px solid var(--step-ca-border);
+    border-radius: 8px;
+    background: var(--step-ca-surface-alt);
+    color: var(--step-ca-text);
+  }
+
+  .step-ca-result pre {
+    white-space: pre-wrap;
+    word-break: break-word;
+    margin: 10px 0 0;
+    color: inherit;
+  }
+
+  .step-ca-processing {
+    position: fixed;
+    inset: 0;
+    display: none;
+    align-items: center;
+    justify-content: center;
+    z-index: 2100;
+    background: rgba(0, 0, 0, 0.42);
+    padding: 24px;
+  }
+
+  .step-ca-processing.is-open {
+    display: flex;
+  }
+
+  .step-ca-processing-card {
+    width: min(520px, 100%);
+    background: var(--step-ca-surface);
+    color: var(--step-ca-text);
+    border: 1px solid var(--step-ca-border);
+    border-radius: 12px;
+    box-shadow: var(--step-ca-shadow);
+    padding: 22px 24px;
+    text-align: center;
+  }
+
+  .step-ca-processing-spinner {
+    width: 34px;
+    height: 34px;
+    margin: 0 auto 14px;
+    border-radius: 50%;
+    border: 3px solid var(--step-ca-border);
+    border-top-color: var(--orange-800, #f15a2c);
+    animation: step-ca-spin 0.9s linear infinite;
+  }
+
+  .step-ca-processing-title {
+    font-size: 18px;
+    font-weight: 700;
+    margin-bottom: 8px;
+  }
+
+  .step-ca-processing-text {
+    color: var(--step-ca-text-muted);
+    line-height: 1.55;
+  }
+
+  @keyframes step-ca-spin {
+    to {
+      transform: rotate(360deg);
+    }
+  }
+</style>
+
+<div class="step-ca-hidden-shell"></div>
+
+<div class="step-ca-modal-backdrop" id="step-ca-modal-backdrop">
+  <div class="step-ca-modal" role="dialog" aria-modal="true" aria-labelledby="step-ca-modal-title">
+    <div class="step-ca-modal-header">
+      <div class="step-ca-modal-title" id="step-ca-modal-title">Step CA WebGUI ACME Settings</div>
+      <button type="button" class="step-ca-close" id="step-ca-close-modal" aria-label="Close">&times;</button>
+    </div>
+
+    <form method="POST" id="step-ca-form">
+      <table class="step-ca-grid">
+        <tr>
+          <td>ACME directory URL</td>
+          <td>
+            <input type="text" name="ACME_DIRECTORY_URL" value="<?= h($config['ACME_DIRECTORY_URL']) ?>">
+            <div class="step-ca-note">Default matches this repo's Step CA: <code>https://step-ca.lan:9000/acme/acme/directory</code></div>
+          </td>
+        </tr>
+        <tr>
+          <td>Root certificate URL</td>
+          <td>
+            <input type="text" name="ROOT_CERT_URL" value="<?= h($config['ROOT_CERT_URL']) ?>">
+            <div class="step-ca-note">Used to bootstrap trust for the ACME client. For this stack the default is <code>https://step-ca.lan:9000/roots.pem</code>.</div>
+          </td>
+        </tr>
+        <tr>
+          <td>ACME account email</td>
+          <td>
+            <input type="text" name="CONTACT_EMAIL" value="<?= h($config['CONTACT_EMAIL']) ?>">
+            <div class="step-ca-note">Optional, but helpful for ACME account registration metadata.</div>
+          </td>
+        </tr>
+        <tr>
+          <td>Domain override</td>
+          <td>
+            <input type="text" name="DOMAIN_OVERRIDE" value="<?= h($config['DOMAIN_OVERRIDE']) ?>">
+            <div class="step-ca-note">Leave blank to use <code>[server name].[local TLD]</code> from Unraid. Current preview: <code><?= h($domainPreview) ?></code></div>
+          </td>
+        </tr>
+        <tr>
+          <td>Server name override</td>
+          <td>
+            <input type="text" name="SERVER_NAME_OVERRIDE" value="<?= h($config['SERVER_NAME_OVERRIDE']) ?>">
+            <div class="step-ca-note">Only needed if the bundle filename should not use the current Unraid server name. Current target bundle: <code><?= h($bundlePath) ?></code></div>
+          </td>
+        </tr>
+        <tr>
+          <td>Challenge mode</td>
+          <td>
+            <select name="CHALLENGE_MODE">
+              <option value="standalone" <?= $config['CHALLENGE_MODE'] === 'standalone' ? 'selected' : '' ?>>HTTP-01 standalone on port 80</option>
+              <option value="alpn" <?= $config['CHALLENGE_MODE'] === 'alpn' ? 'selected' : '' ?>>TLS-ALPN-01 on port 443</option>
+            </select>
+            <div class="step-ca-note">Both modes temporarily stop the Unraid WebGUI if you leave that option enabled below.</div>
+          </td>
+        </tr>
+        <tr>
+          <td>Allow insecure root bootstrap</td>
+          <td>
+            <?= yes_no_field('ACME_INSECURE_BOOTSTRAP', $config) ?>
+            <div class="step-ca-note">When set to Yes, the plugin uses <code>curl -k</code> only while fetching the initial Step CA root bundle.</div>
+          </td>
+        </tr>
+        <tr>
+          <td>Auto renew</td>
+          <td>
+            <?= yes_no_field('AUTO_RENEW', $config) ?>
+            <div class="step-ca-note">Adds a managed root crontab entry that runs the renew action.</div>
+          </td>
+        </tr>
+        <tr>
+          <td>Renew cron schedule</td>
+          <td>
+            <input type="text" name="RENEW_CRON" value="<?= h($config['RENEW_CRON']) ?>">
+            <div class="step-ca-note">Standard five-field cron syntax. Default: <code>17 3 * * *</code></div>
+          </td>
+        </tr>
+        <tr>
+          <td>Enable SSL after install</td>
+          <td>
+            <?= yes_no_field('ENABLE_SSL_AFTER_ISSUE', $config) ?>
+            <div class="step-ca-note">Runs <code>use_ssl yes</code> after a successful install so Unraid serves the new custom certificate.</div>
+          </td>
+        </tr>
+        <tr>
+          <td>Stop WebGUI for challenge</td>
+          <td>
+            <?= yes_no_field('STOP_WEBSERVER_FOR_CHALLENGE', $config) ?>
+            <div class="step-ca-note">Recommended when using standalone or ALPN validation because the ACME client needs port 80 or 443.</div>
+          </td>
+        </tr>
+      </table>
+
+      <div class="step-ca-actions">
+        <button type="submit" name="action_save" class="btn">Save</button>
+        <button type="submit" name="action_issue" class="btn btn-primary">Save and Issue Cert</button>
+        <button type="submit" name="action_renew" class="btn">Save and Renew</button>
+        <button type="submit" name="action_status" class="btn">Save and Show Status</button>
+      </div>
+
+      <?php foreach ($messages as $message): ?>
+        <div class="notice" style="margin-top:16px;"><?= h($message) ?></div>
+      <?php endforeach; ?>
+
+      <?php if (trim($output) !== ''): ?>
+        <div class="step-ca-result">
+          <strong>Command output</strong>
+          <pre><?= h(trim($output)) ?></pre>
+        </div>
+      <?php endif; ?>
+    </form>
+  </div>
+</div>
+
+<div class="step-ca-processing" id="step-ca-processing" aria-live="polite">
+  <div class="step-ca-processing-card">
+    <div class="step-ca-processing-spinner"></div>
+    <div class="step-ca-processing-title">Working...</div>
+    <div class="step-ca-processing-text" id="step-ca-processing-text">
+      Please wait while the Step CA command finishes. The page will update automatically when the command returns.
+    </div>
+  </div>
+</div>
+
+<script>
+  (function () {
+    const backdrop = document.getElementById('step-ca-modal-backdrop');
+    const closeButton = document.getElementById('step-ca-close-modal');
+    const form = document.getElementById('step-ca-form');
+    const processing = document.getElementById('step-ca-processing');
+    const processingText = document.getElementById('step-ca-processing-text');
+
+    if (!backdrop || !closeButton || !form || !processing || !processingText) {
+      return;
+    }
+
+    const openModal = () => backdrop.classList.add('is-open');
+    const closeModal = () => {
+      backdrop.classList.remove('is-open');
+      if (window.history.length > 1) {
+        window.history.back();
+      } else {
+        window.location = '/Settings/Utilities';
+      }
+    };
+    const openProcessing = (message) => {
+      processingText.textContent = message;
+      processing.classList.add('is-open');
+    };
+    const closeProcessing = () => processing.classList.remove('is-open');
+
+    closeButton.addEventListener('click', closeModal);
+    backdrop.addEventListener('click', (event) => {
+      if (event.target === backdrop) {
+        closeModal();
+      }
+    });
+    document.addEventListener('keydown', (event) => {
+      if (event.key === 'Escape') {
+        closeModal();
+      }
+    });
+
+    form.addEventListener('submit', async (event) => {
+      event.preventDefault();
+
+      const submitter = event.submitter;
+      const submitName = submitter && submitter.name ? submitter.name : 'action_save';
+      const messages = {
+        action_save: 'Saving Step CA settings. Please wait...',
+        action_issue: 'Issuing the WebGUI certificate. This can take a little while. Please wait and do not refresh the page...',
+        action_renew: 'Renewing the WebGUI certificate. Please wait and do not refresh the page...',
+        action_status: 'Loading plugin status. Please wait...'
+      };
+
+      const formData = new FormData(form);
+      if (submitter && submitter.name) {
+        formData.set(submitter.name, submitter.value || '1');
+      } else {
+        formData.set(submitName, '1');
+      }
+
+      openProcessing(messages[submitName] || 'Working. Please wait...');
+
+      Array.from(form.elements).forEach((element) => {
+        element.disabled = true;
+      });
+
+      try {
+        const response = await fetch(window.location.href, {
+          method: 'POST',
+          body: formData,
+          credentials: 'same-origin',
+          headers: {
+            'X-Requested-With': 'XMLHttpRequest'
+          }
+        });
+
+        const html = await response.text();
+        document.open();
+        document.write(html);
+        document.close();
+      } catch (error) {
+        closeProcessing();
+        Array.from(form.elements).forEach((element) => {
+          element.disabled = false;
+        });
+        alert('The Step CA command did not complete cleanly. Please try again.');
+      }
+    });
+
+    openModal();
+  })();
+</script>

@@ -36,6 +36,10 @@ A complete Docker-based ACME-compatible Certificate Authority with a web interfa
 - Docker & Docker Compose
 - macOS, Linux, or Windows with Docker installed
 
+## Pre-Deployment
+
+No pre-deployment steps are required. Docker named volumes will be created automatically on first run.
+
 ## Quick Start
 
 ### 1. Clone/Navigate to the Project
@@ -56,7 +60,7 @@ This will:
 - Build the frontend container
 - Initialize the CA with ACME support
 - Start all services
-- Persist data to the path specified in `VOLUMES_PATH` (.env)
+- Persist data using Docker named volumes
 
 ### 3. Access the Web Interface
 
@@ -101,33 +105,29 @@ cp .env.example .env
 ```
 
 Key variables:
-- `VOLUMES_PATH` - Host path for persistent storage (default: `./data`)
-  - Test environment: `./data`
-  - Home lab: `/mnt/storage/ca_server` or `/var/lib/docker-volumes/ca_server`
-- `CA_URL` - Internal CA URL (for backend)
 - `CA_PASSWORD` - CA administrator password (default: changeme)
 - `ADMIN_USERNAME` - Backend admin username
 - `ADMIN_PASSWORD` - Backend admin password (default: changeme)
-- `REACT_APP_API_URL` - Frontend API endpoint
 - `CERT_DURATION` - Default certificate validity (default: 2160h = 90 days)
 
 ### Persistence
 
-Certificates and CA configuration are stored on the host filesystem at the path specified by `VOLUMES_PATH` in your `.env` file:
+Certificates and CA configuration are stored in Docker named volumes:
 
-```
-VOLUMES_PATH/
-├── ca_certs/     # CA certificates and keys
-└── ca_config/    # CA configuration files
-```
+- `ca_certs` - CA certificates and keys
+- `ca_config` - CA configuration files
 
-**For home lab setup**, change `VOLUMES_PATH` to a persistent storage location:
-```env
-# Example: NFS mount or dedicated disk
-VOLUMES_PATH=/mnt/storage/ca_server
+Named volumes are managed by Docker and persist data across container restarts and updates. To backup or inspect the data:
 
-# Or specific docker volumes directory
-VOLUMES_PATH=/var/lib/docker-volumes/ca_server
+```bash
+# List volumes
+docker volume ls
+
+# Inspect a volume
+docker volume inspect ca_certs
+
+# Backup a volume (example)
+docker run --rm -v ca_certs:/data -v $(pwd):/backup alpine tar czf /backup/ca_certs.tar.gz -C /data .
 ```
 
 ## API Endpoints
@@ -152,7 +152,11 @@ DELETE /api/certificates/:id        - Delete certificate record
 GET /api/acme/directory - Get ACME directory
 ```
 
-## Home Lab Best Practices
+## Recent Changes
+
+- **Persistence**: Switched to Docker named volumes for better portability and to avoid host filesystem permission issues.
+- **CA Initialization**: Fixed compatibility with Step CA v0.24.2, including correct flags and password handling.
+- **Container Setup**: Updated Dockerfile to build both `step-ca` and `step` binaries from source.
 
 ### 1. Domain Names
 
@@ -172,24 +176,27 @@ grafana.home.lab
 
 To avoid browser warnings, trust the CA's root certificate:
 
+**Extract CA certificate from the named volume:**
+```bash
+# Create a temporary container to copy the certificate
+docker run --rm -v ca_certs:/certs alpine cp /certs/certs/root_ca.crt /tmp/root_ca.crt
+docker cp $(docker ps -lq):/tmp/root_ca.crt ./root_ca.crt
+```
+
 **On macOS:**
 ```bash
-# Extract CA certificate from the running container
-docker cp ca_authority:/home/step/certs/certs/root_ca.crt ./root_ca.crt
-
 # Add to macOS Keychain
 security add-trusted-cert -d -r trustRoot -k ~/Library/Keychains/login.keychain ./root_ca.crt
 ```
 
 **On Linux:**
 ```bash
-docker cp ca_authority:/home/step/certs/certs/root_ca.crt /etc/pki/ca-trust/source/anchors/
-update-ca-trust
+sudo cp root_ca.crt /etc/pki/ca-trust/source/anchors/
+sudo update-ca-trust
 ```
 
 **On Windows:**
 ```powershell
-docker cp ca_authority:/home/step/certs/certs/root_ca.crt root_ca.crt
 certutil -addstore "Trusted Root Certification Authorities" root_ca.crt
 ```
 

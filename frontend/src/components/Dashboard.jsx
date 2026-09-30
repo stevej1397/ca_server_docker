@@ -5,29 +5,64 @@ import './Dashboard.css'
 function Dashboard({ caHealth, caInfo }) {
   const [certCount, setCertCount] = useState(0)
   const [expiringSoon, setExpiringSoon] = useState(0)
+  const [acmeCertificates, setAcmeCertificates] = useState([])
+  const [acmeTracker, setAcmeTracker] = useState(null)
 
   useEffect(() => {
     const fetchStats = async () => {
       try {
-        const response = await api.get('/certificates')
-        setCertCount(response.data.total)
+        const [certificateResponse, acmeResponse] = await Promise.all([
+          api.get('/certificates'),
+          api.get('/acme/certificates').catch(() => null),
+        ])
+
+        setCertCount(certificateResponse.data.total)
         
         const now = new Date()
         const thirtyDaysFromNow = new Date(now.getTime() + 30 * 24 * 60 * 60 * 1000)
         
-        const expiring = response.data.certificates.filter(cert => {
+        const expiring = certificateResponse.data.certificates.filter(cert => {
           const expiresAt = new Date(cert.expiresAt)
           return expiresAt <= thirtyDaysFromNow && expiresAt > now && cert.status === 'issued'
         }).length
         
         setExpiringSoon(expiring)
+
+        if (acmeResponse?.data) {
+          setAcmeTracker({
+            total: acmeResponse.data.total,
+            valid: acmeResponse.data.valid,
+            expired: acmeResponse.data.expired,
+            lastCheckedAt: acmeResponse.data.lastCheckedAt,
+            lastSuccessAt: acmeResponse.data.tracker?.lastSuccessAt,
+            lastError: acmeResponse.data.tracker?.lastError,
+          })
+          setAcmeCertificates(acmeResponse.data.certificates || [])
+        }
       } catch (error) {
         console.error('Failed to fetch stats:', error)
       }
     }
 
     fetchStats()
+    const interval = setInterval(fetchStats, 30000)
+    return () => clearInterval(interval)
   }, [])
+
+  const recentAcmeCertificates = acmeCertificates.slice(0, 5)
+
+  const formatDateTime = (value) => {
+    if (!value) {
+      return 'Unknown'
+    }
+
+    const date = new Date(value)
+    if (Number.isNaN(date.getTime())) {
+      return value
+    }
+
+    return date.toLocaleString()
+  }
 
   return (
     <div className="dashboard">
@@ -54,9 +89,17 @@ function Dashboard({ caHealth, caInfo }) {
         </div>
 
         <div className="stat-card">
-          <h3>Total Certificates</h3>
+          <h3>Certificates</h3>
           <p className="stat-value">{certCount}</p>
-          <p className="stat-detail">Issued certificates</p>
+          <p className="stat-detail">App-issued certificates</p>
+          <p className="stat-subdetail">
+            ACME valid: {acmeTracker?.valid ?? 0}
+          </p>
+          <p className="stat-detail">
+            {acmeTracker?.lastError
+              ? 'Tracker has a sync error'
+              : `${acmeTracker?.total ?? 0} observed in Step CA logs`}
+          </p>
         </div>
 
         <div className="stat-card">
@@ -88,6 +131,50 @@ function Dashboard({ caHealth, caInfo }) {
         </div>
       </div>
 
+      <div className="card">
+        <h2>Recent ACME Certificates</h2>
+        {acmeTracker?.lastError && (
+          <p className="tracker-error">{acmeTracker.lastError}</p>
+        )}
+        {recentAcmeCertificates.length > 0 ? (
+          <table>
+            <thead>
+              <tr>
+                <th>Certificate</th>
+                <th>Expires</th>
+                <th>Source</th>
+              </tr>
+            </thead>
+            <tbody>
+              {recentAcmeCertificates.map((certificate) => (
+                <tr key={certificate.id}>
+                  <td>
+                    <div>{certificate.displayName}</div>
+                    <div className="acme-cert-detail monospace">
+                      {(certificate.dnsNames && certificate.dnsNames.length > 0
+                        ? certificate.dnsNames.join(', ')
+                        : certificate.log?.path) || 'No SANs captured'}
+                    </div>
+                  </td>
+                  <td>{formatDateTime(certificate.expiresAt)}</td>
+                  <td>
+                    <div>{certificate.provisioner || 'acme'}</div>
+                    <div className="acme-cert-detail">
+                      {certificate.log?.userAgent || 'Unknown client'}
+                    </div>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        ) : (
+          <p>No ACME-issued certificates have been observed in the Step CA logs yet.</p>
+        )}
+        <p className="stat-detail">
+          Last synced: {formatDateTime(acmeTracker?.lastSuccessAt || acmeTracker?.lastCheckedAt)}
+        </p>
+      </div>
+
       {caInfo && (
         <div className="card">
           <h2>CA Information</h2>
@@ -104,6 +191,31 @@ function Dashboard({ caHealth, caInfo }) {
               <tr>
                 <td><strong>ACME Directory:</strong></td>
                 <td className="monospace">{caInfo.acmeEndpoint}</td>
+              </tr>
+              <tr>
+                <td><strong>Root Certificate:</strong></td>
+                <td>
+                  <div>
+                    <a
+                      href="/api/ca/root"
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      download
+                    >
+                      Download CA root cert
+                    </a>
+                  </div>
+                  <div>
+                    <a
+                      href="/api/ca/intermediate"
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      download
+                    >
+                      Download CA intermediate cert
+                    </a>
+                  </div>
+                </td>
               </tr>
             </tbody>
           </table>

@@ -40,6 +40,12 @@
   margin: 0.5rem 0 0 0;
 }
 
+.stat-subdetail {
+  font-size: 0.95rem;
+  color: var(--text-primary);
+  margin: 0.75rem 0 0 0;
+}
+
 .info-section {
   margin-bottom: 3rem;
 }
@@ -75,11 +81,33 @@ table tbody tr {
   border-bottom: 1px solid var(--border);
 }
 
+table thead th {
+  text-align: left;
+  padding: 1rem;
+  color: var(--text-secondary);
+  font-size: 0.875rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
 table td {
   padding: 1rem;
+  vertical-align: top;
 }
 
 table td:first-child {
   width: 200px;
   color: var(--text-secondary);
+}
+
+.acme-cert-detail {
+  margin-top: 0.35rem;
+  font-size: 0.875rem;
+  color: var(--text-secondary);
+  word-break: break-word;
+}
+
+.tracker-error {
+  color: #b42318;
+  margin-bottom: 1rem;
 }

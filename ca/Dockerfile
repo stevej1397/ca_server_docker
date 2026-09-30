@@ -8,13 +8,18 @@ RUN git clone https://github.com/smallstep/certificates.git && \
     git checkout v0.24.2 && \
     make bin/step-ca
 
+RUN git clone https://github.com/smallstep/cli.git && \
+    cd cli && \
+    git checkout v0.24.2 && \
+    make bin/step
+
 FROM alpine:3.18
 
 RUN apk add --no-cache curl bash ca-certificates openssl
 
 # Copy step-ca binary from builder
 COPY --from=builder /tmp/certificates/bin/step-ca /usr/local/bin/
-COPY --from=builder /tmp/certificates/bin/step /usr/local/bin/
+COPY --from=builder /tmp/cli/bin/step /usr/local/bin/
 
 # Create step user
 RUN addgroup step && adduser -D -G step step
@@ -28,6 +33,7 @@ USER step
 EXPOSE 9000
 
 # Initialize CA and start it
+CMD ["/tmp/init-ca.sh"]
 COPY init-ca.sh /tmp/
 USER root
 RUN chmod +x /tmp/init-ca.sh
