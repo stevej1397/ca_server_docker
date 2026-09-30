@@ -467,7 +467,7 @@ function runOpenSSL(args, opts = {}) {
   return result.stdout;
 }
 
-function generateX509Certificate(commonName, altNames = [], validityDays = 365) {
+function generateX509Certificate(commonName, altNames = [], validityDays = 365, keyType = 'ec') {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'stepca-'));
   try {
     const keyPath = path.join(tmpDir, 'cert.key');
@@ -475,8 +475,13 @@ function generateX509Certificate(commonName, altNames = [], validityDays = 365) 
     const certPath = path.join(tmpDir, 'cert.pem');
     const extPath = path.join(tmpDir, 'openssl.ext');
 
-    // Generate private key
-    runOpenSSL(['ecparam', '-name', 'prime256v1', '-genkey', '-noout', '-out', keyPath]);
+    // Generate private key. RSA is for devices that can't use EC certs
+    // (e.g. UniFi OS, which parses its web cert with node-forge).
+    if (keyType === 'rsa') {
+      runOpenSSL(['genpkey', '-algorithm', 'RSA', '-pkeyopt', 'rsa_keygen_bits:2048', '-out', keyPath]);
+    } else {
+      runOpenSSL(['ecparam', '-name', 'prime256v1', '-genkey', '-noout', '-out', keyPath]);
+    }
 
     // Build SAN list: always include the commonName plus any additional altNames.
     const sanNames = new Set([commonName, ...altNames]);
@@ -610,14 +615,17 @@ app.get('/api/ca/info', async (req, res) => {
 // Issue a certificate (x509 PEM signed by the CA)
 app.post('/api/certificates/issue', async (req, res) => {
   try {
-    const { commonName, altNames, validityDays } = req.body;
+    const { commonName, altNames, validityDays, keyType = 'ec' } = req.body;
 
     if (!commonName) {
       return res.status(400).json({ error: 'commonName is required' });
     }
+    if (!['ec', 'rsa'].includes(keyType)) {
+      return res.status(400).json({ error: "keyType must be 'ec' or 'rsa'" });
+    }
 
     const certId = `cert-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
-    const { certPem, keyPem } = generateX509Certificate(commonName, altNames || [], validityDays || 365);
+    const { certPem, keyPem } = generateX509Certificate(commonName, altNames || [], validityDays || 365, keyType);
 
     const certificate = {
       id: certId,

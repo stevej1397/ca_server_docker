@@ -75,6 +75,24 @@ https://step-ca.lan:9000
   - default duration: `2160h` (90 days)
   - max duration: `8760h` (1 year)
 
+## Other Devices Using This CA
+
+See the "Devices Using This CA" section of `README.md` for the user-facing details. What an agent needs to know:
+
+- Backend `POST /api/certificates/issue` signs directly with the intermediate key via openssl; it does not go through step-ca.
+  - It accepts `keyType: "ec"` (default) or `"rsa"`.
+  - `./backend` is bind-mounted into `ca_backend`, so `docker restart ca_backend` applies server.js edits.
+  - The JWK `admin` provisioner has no claims, so `step ca certificate` through it only gives 24h certs. Use the backend for long-lived manual certs.
+- Proxmox `pve-01.lan`–`pve-05.lan` (192.168.20.51–55): native `pvenode acme` with the http-01 challenge and a cluster account named `default`. Nothing in this repo. Failed validations show up in `docker logs ca_authority` as `could not connect to validation target`; the usual cause is DNS inside the container. The DNS servers are 192.168.1.2 (caches) and 192.168.1.1.
+- UDM Pro `unifi.lan` / 192.168.1.1 (UniFi OS 5.x): `udm-cert/udm-cert-deploy.sh`, documented in `udm-cert/README.md`.
+  - Reachable over SSH as `root@unifi.lan` with the key in `/root/.ssh`, which is persisted at `/boot/config/ssh/root`.
+  - The cert **must be RSA**: `unifi-core` parses `/data/unifi-core/config/unifi-core.crt` with node-forge and regenerates its self-signed cert if parsing fails.
+  - Issued files and `deploy.log` are in `/mnt/user/appdata/ca-issued-certs/unifi.lan/`.
+  - Runs daily at 03:27 from `/boot/config/plugins/dynamix/udm-cert.cron`, installed by the user on 2026-09-29.
+    `update_cron` merges that file into `/etc/cron.d/root`, so check with `grep udm /etc/cron.d/root`, not `crontab -l`.
+    The auto-mode classifier blocks agents from installing cron jobs; give the user the command instead.
+- Homarr (container `homarr`): trusts `/mnt/user/appdata/homarr/appdata/trusted-certificates/*.crt|*.pem` on top of Node's public roots, re-read on every request. `home-lab-root-ca.crt` there is this CA's root. `NODE_TLS_REJECT_UNAUTHORIZED=0` is still set in its Unraid template.
+
 ## Practical Workflow
 
 - Always start shell commands with:

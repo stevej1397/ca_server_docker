@@ -147,10 +147,63 @@ POST   /api/certificates/:id/revoke - Revoke certificate
 DELETE /api/certificates/:id        - Delete certificate record
 ```
 
+`POST /api/certificates/issue` takes `{ commonName, altNames, validityDays, keyType }`.
+`keyType` is `"ec"` (P-256, the default) or `"rsa"` (2048-bit) for devices that can't use EC certs.
+
 ### ACME
 ```
 GET /api/acme/directory - Get ACME directory
 ```
+
+## Devices Using This CA
+
+These hosts on the network get their HTTPS certs from this CA or trust it. The
+root CA SHA-256 fingerprint is
+`17:FA:3F:91:F7:AA:0C:EF:8B:7E:8C:0F:68:57:FB:F1:0F:AC:43:B1:4D:7D:A1:21:24:52:F2:EB:61:05:06:04`.
+
+### Unraid WebGUI
+
+Handled by the `step-ca-webgui-acme` plugin in `unraid-plugin/` (acme.sh + cron on the Unraid host).
+
+### Proxmox cluster (`pve-01.lan` … `pve-05.lan`, 192.168.20.51–55)
+
+The built-in Proxmox ACME client is used. There is nothing in this repo for it.
+
+- Each node trusts the root: `/usr/local/share/ca-certificates/step-ca-root.crt`, then `update-ca-certificates`.
+- One cluster-wide ACME account named `default`, with directory `https://step-ca.lan:9000/acme/acme/directory`.
+- Each node has `pvenode config set --acme domains=pve-0X.lan` and uses the http-01 challenge.
+- Certs last 90 days. `pve-daily-update.timer` on each node renews them when fewer than 30 days are left.
+
+If an order or renewal hangs at `pending`, the CA can't reach the node. Check
+`docker logs ca_authority | grep pve-0X` for `could not connect to validation target`. Then check:
+
+- DNS from inside the CA: `docker exec ca_authority getent hosts pve-0X.lan`. Two typos in DNS records caused this once already.
+- Port 80 on the node is reachable from the CA.
+
+To force a renewal on a node: `pvenode acme cert renew --force`.
+
+### UniFi Dream Machine Pro (`unifi.lan`, 192.168.1.1)
+
+UniFi OS can't use a custom ACME server. `udm-cert/udm-cert-deploy.sh` issues an RSA cert through the backend and installs it over SSH.
+See [udm-cert/README.md](udm-cert/README.md) for how it works, scheduling, troubleshooting and rollback.
+
+### Homarr dashboard (container `homarr`)
+
+Homarr trusts Node's public CAs plus every `.crt`/`.pem` in `/mnt/user/appdata/homarr/appdata/trusted-certificates`.
+You can also manage that folder from Management → Tools → Certificates in the Homarr UI.
+
+- `home-lab-root-ca.crt` in that folder is this CA's root. It is required: the intermediate alone gives `UNABLE_TO_GET_ISSUER_CERT`.
+- The container still has `NODE_TLS_REJECT_UNAUTHORIZED=0` in its Unraid template, which turns off TLS checking entirely.
+  It can be removed now that the root is trusted. Check each integration afterward.
+
+To test a host from inside Homarr, using the same trust list Homarr builds and with checking forced on, change `URL`:
+
+```bash
+docker exec -e NODE_TLS_REJECT_UNAUTHORIZED=1 -e URL=https://unifi.lan/ homarr node -e 'const tls=require("tls"),fs=require("fs"),d="/appdata/trusted-certificates";const ca=tls.rootCertificates.concat(fs.readdirSync(d).filter(f=>/\.(crt|pem)$/.test(f)).map(f=>fs.readFileSync(d+"/"+f,"utf8")));require("https").get(process.env.URL,{ca},r=>console.log("OK",r.statusCode)).on("error",e=>console.log("FAIL",e.code))'
+```
+
+- `UNABLE_TO_GET_ISSUER_CERT` means the CA isn't trusted.
+- `ERR_TLS_CERT_ALTNAME_INVALID` means the cert doesn't cover the name or IP in the URL.
 
 ## Recent Changes
 
