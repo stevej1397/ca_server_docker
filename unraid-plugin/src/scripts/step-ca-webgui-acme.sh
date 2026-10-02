@@ -24,6 +24,7 @@ ACME_DIRECTORY_URL_DEFAULT="https://step-ca.lan:9000/acme/acme/directory"
 ROOT_CERT_URL_DEFAULT="https://step-ca.lan:9000/roots.pem"
 CONTACT_EMAIL_DEFAULT=""
 DOMAIN_OVERRIDE_DEFAULT=""
+EXTRA_DOMAINS_DEFAULT=""
 SERVER_NAME_OVERRIDE_DEFAULT=""
 CHALLENGE_MODE_DEFAULT="standalone"
 ACME_INSECURE_BOOTSTRAP_DEFAULT="yes"
@@ -36,6 +37,7 @@ MAX_FORCE_RENEW_SECONDS=2592000
 
 WEBGUI_WAS_STOPPED=0
 RESOLVED_DOMAIN=""
+ALL_DOMAINS=()
 TARGET_SERVER_NAME=""
 TARGET_BUNDLE=""
 CERT_NOT_AFTER=""
@@ -86,6 +88,7 @@ ACME_DIRECTORY_URL="${ACME_DIRECTORY_URL_DEFAULT}"
 ROOT_CERT_URL="${ROOT_CERT_URL_DEFAULT}"
 CONTACT_EMAIL="${CONTACT_EMAIL_DEFAULT}"
 DOMAIN_OVERRIDE="${DOMAIN_OVERRIDE_DEFAULT}"
+EXTRA_DOMAINS="${EXTRA_DOMAINS_DEFAULT}"
 SERVER_NAME_OVERRIDE="${SERVER_NAME_OVERRIDE_DEFAULT}"
 CHALLENGE_MODE="${CHALLENGE_MODE_DEFAULT}"
 ACME_INSECURE_BOOTSTRAP="${ACME_INSECURE_BOOTSTRAP_DEFAULT}"
@@ -110,6 +113,7 @@ load_config() {
   ROOT_CERT_URL="${ROOT_CERT_URL:-${ROOT_CERT_URL_DEFAULT}}"
   CONTACT_EMAIL="${CONTACT_EMAIL:-${CONTACT_EMAIL_DEFAULT}}"
   DOMAIN_OVERRIDE="${DOMAIN_OVERRIDE:-${DOMAIN_OVERRIDE_DEFAULT}}"
+  EXTRA_DOMAINS="${EXTRA_DOMAINS:-${EXTRA_DOMAINS_DEFAULT}}"
   SERVER_NAME_OVERRIDE="${SERVER_NAME_OVERRIDE:-${SERVER_NAME_OVERRIDE_DEFAULT}}"
   CHALLENGE_MODE="${CHALLENGE_MODE:-${CHALLENGE_MODE_DEFAULT}}"
   ACME_INSECURE_BOOTSTRAP="${ACME_INSECURE_BOOTSTRAP:-${ACME_INSECURE_BOOTSTRAP_DEFAULT}}"
@@ -170,6 +174,20 @@ resolve_domain() {
     RESOLVED_DOMAIN="${server_name}.${local_tld}"
   fi
 
+  # The primary name stays first so acme.sh keeps filing the certificate under it.
+  local extra existing duplicate
+  ALL_DOMAINS=("${RESOLVED_DOMAIN}")
+  for extra in ${EXTRA_DOMAINS//,/ }; do
+    duplicate=0
+    for existing in "${ALL_DOMAINS[@]}"; do
+      if [ "${existing,,}" = "${extra,,}" ]; then
+        duplicate=1
+        break
+      fi
+    done
+    [ "${duplicate}" -eq 1 ] || ALL_DOMAINS+=("${extra}")
+  done
+
   if [ -n "${SERVER_NAME_OVERRIDE}" ]; then
     TARGET_SERVER_NAME="${SERVER_NAME_OVERRIDE}"
   elif [ -n "${IDENT_NAME:-}" ]; then
@@ -181,6 +199,26 @@ resolve_domain() {
   TARGET_SERVER_NAME="$(sanitize_server_name "${TARGET_SERVER_NAME}")"
   [ -n "${TARGET_SERVER_NAME}" ] || fail "Unable to determine the target Unraid server name."
   TARGET_BUNDLE="${SSL_CERT_DIR}/${TARGET_SERVER_NAME}_unraid_bundle.pem"
+}
+
+domain_args() {
+  local domain
+  for domain in "${ALL_DOMAINS[@]}"; do
+    printf -- '-d\n%s\n' "${domain}"
+  done
+}
+
+# Prints the first configured name the installed bundle does not cover, if any.
+# openssl -checkhost exits 0 either way, so its message has to be read instead.
+first_uncovered_domain() {
+  local domain
+  for domain in "${ALL_DOMAINS[@]}"; do
+    if ! openssl x509 -in "${TARGET_BUNDLE}" -noout -checkhost "${domain}" 2>/dev/null | grep -q ' does match'; then
+      printf '%s\n' "${domain}"
+      return 0
+    fi
+  done
+  return 1
 }
 
 derive_root_url() {
@@ -365,7 +403,10 @@ validate_bundle() {
 
   [ -f "${TARGET_BUNDLE}" ] || fail "Expected bundle was not created at ${TARGET_BUNDLE}."
   openssl x509 -in "${TARGET_BUNDLE}" -noout >/dev/null 2>&1 || fail "Installed bundle does not begin with a valid certificate."
-  openssl x509 -in "${TARGET_BUNDLE}" -noout -checkhost "${RESOLVED_DOMAIN}" >/dev/null 2>&1 || fail "Installed certificate does not match ${RESOLVED_DOMAIN}."
+  local uncovered
+  if uncovered="$(first_uncovered_domain)"; then
+    fail "Installed certificate does not match ${uncovered}."
+  fi
   CERT_NOT_AFTER="$(openssl x509 -in "${TARGET_BUNDLE}" -noout -enddate | cut -d= -f2-)"
 }
 
@@ -415,8 +456,10 @@ run_acme_issue() {
     --server "${ACME_DIRECTORY_URL}"
     --ca-bundle "${ROOT_CA_FILE}"
     --keylength 2048
-    -d "${RESOLVED_DOMAIN}"
   )
+  local domain_flags
+  mapfile -t domain_flags < <(domain_args)
+  acme_cmd+=("${domain_flags[@]}")
 
   if [ "${CHALLENGE_MODE}" = "alpn" ]; then
     acme_cmd+=(--alpn)
@@ -424,7 +467,7 @@ run_acme_issue() {
     acme_cmd+=(--standalone)
   fi
 
-  log "Requesting certificate for ${RESOLVED_DOMAIN} via ${ACME_DIRECTORY_URL}"
+  log "Requesting certificate for ${ALL_DOMAINS[*]} via ${ACME_DIRECTORY_URL}"
   "${acme_cmd[@]}" --issue --force
 }
 
@@ -434,8 +477,10 @@ run_acme_renew() {
     --server "${ACME_DIRECTORY_URL}"
     --ca-bundle "${ROOT_CA_FILE}"
     --keylength 2048
-    -d "${RESOLVED_DOMAIN}"
   )
+  local domain_flags
+  mapfile -t domain_flags < <(domain_args)
+  acme_cmd+=("${domain_flags[@]}")
 
   if [ "${CHALLENGE_MODE}" = "alpn" ]; then
     acme_cmd+=(--alpn)
@@ -443,7 +488,16 @@ run_acme_renew() {
     acme_cmd+=(--standalone)
   fi
 
-  if [ -d "${ACME_HOME}/${RESOLVED_DOMAIN}" ]; then
+  local uncovered=""
+  if [ -f "${TARGET_BUNDLE}" ]; then
+    uncovered="$(first_uncovered_domain)" || uncovered=""
+  fi
+
+  if [ -d "${ACME_HOME}/${RESOLVED_DOMAIN}" ] && [ -n "${uncovered}" ]; then
+    # acme.sh --renew reuses the names stored at issue time, so a changed name list needs a fresh order.
+    log "Installed certificate does not cover ${uncovered}; issuing a fresh certificate for ${ALL_DOMAINS[*]}"
+    "${acme_cmd[@]}" --issue --force
+  elif [ -d "${ACME_HOME}/${RESOLVED_DOMAIN}" ]; then
     if should_force_renew; then
       log "Renewing certificate for ${RESOLVED_DOMAIN} with --force"
       "${acme_cmd[@]}" --renew --force
@@ -491,7 +545,7 @@ run_certificate_action() {
   validate_bundle
   reload_webgui
 
-  write_state "success" "Installed certificate for ${RESOLVED_DOMAIN}; expires ${CERT_NOT_AFTER}."
+  write_state "success" "Installed certificate for ${ALL_DOMAINS[*]}; expires ${CERT_NOT_AFTER}."
   log "Certificate installed at ${TARGET_BUNDLE}"
   log "Certificate expiry: ${CERT_NOT_AFTER}"
 }
@@ -501,13 +555,14 @@ show_status() {
   resolve_domain
 
   printf 'Resolved domain: %s\n' "${RESOLVED_DOMAIN}"
+  printf 'Certificate names: %s\n' "${ALL_DOMAINS[*]}"
   printf 'Target bundle: %s\n' "${TARGET_BUNDLE}"
   printf 'ACME directory: %s\n' "${ACME_DIRECTORY_URL}"
   printf 'Challenge mode: %s\n' "${CHALLENGE_MODE}"
 
   if [ -f "${TARGET_BUNDLE}" ]; then
     printf 'Installed certificate:\n'
-    openssl x509 -in "${TARGET_BUNDLE}" -noout -subject -issuer -enddate
+    openssl x509 -in "${TARGET_BUNDLE}" -noout -subject -ext subjectAltName -issuer -enddate
   else
     printf 'Installed certificate: none\n'
   fi

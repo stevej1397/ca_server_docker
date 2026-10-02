@@ -17,6 +17,7 @@ $defaults = [
   'ROOT_CERT_URL' => 'https://step-ca.lan:9000/roots.pem',
   'CONTACT_EMAIL' => '',
   'DOMAIN_OVERRIDE' => '',
+  'EXTRA_DOMAINS' => '',
   'SERVER_NAME_OVERRIDE' => '',
   'CHALLENGE_MODE' => 'standalone',
   'ACME_INSECURE_BOOTSTRAP' => 'yes',
@@ -89,6 +90,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     'ROOT_CERT_URL' => post_value('ROOT_CERT_URL', $defaults),
     'CONTACT_EMAIL' => post_value('CONTACT_EMAIL', $defaults),
     'DOMAIN_OVERRIDE' => post_value('DOMAIN_OVERRIDE', $defaults),
+    'EXTRA_DOMAINS' => post_value('EXTRA_DOMAINS', $defaults),
     'SERVER_NAME_OVERRIDE' => post_value('SERVER_NAME_OVERRIDE', $defaults),
     'CHALLENGE_MODE' => in_array(post_value('CHALLENGE_MODE', $defaults), ['standalone', 'alpn'], true) ? post_value('CHALLENGE_MODE', $defaults) : 'standalone',
     'ACME_INSECURE_BOOTSTRAP' => post_value('ACME_INSECURE_BOOTSTRAP', $defaults) === 'no' ? 'no' : 'yes',
@@ -335,6 +337,13 @@ $bundlePath = "/boot/config/ssl/certs/{$bundleServer}_unraid_bundle.pem";
           <td>
             <input type="text" name="DOMAIN_OVERRIDE" value="<?= h($config['DOMAIN_OVERRIDE']) ?>">
             <div class="step-ca-note">Leave blank to use <code>[server name].[local TLD]</code> from Unraid. Current preview: <code><?= h($domainPreview) ?></code></div>
+          </td>
+        </tr>
+        <tr>
+          <td>Additional domains</td>
+          <td>
+            <input type="text" name="EXTRA_DOMAINS" value="<?= h($config['EXTRA_DOMAINS']) ?>">
+            <div class="step-ca-note">Extra names to include in the certificate, separated by spaces or commas, for example <code>n5-pro.lan</code>. The CA must be able to reach this server at each name for validation. Changing this list triggers a fresh certificate on the next renew.</div>
           </td>
         </tr>
         <tr>

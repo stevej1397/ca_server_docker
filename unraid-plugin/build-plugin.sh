@@ -7,7 +7,7 @@ SRC_DIR="${ROOT_DIR}/src"
 OUT_FILE="${ROOT_DIR}/step-ca-webgui-acme.plg"
 
 PLUGIN_NAME="step-ca-webgui-acme"
-PLUGIN_VERSION="${PLUGIN_VERSION:-2026.09.22}"
+PLUGIN_VERSION="${PLUGIN_VERSION:-2026.10.02}"
 PLUGIN_AUTHOR="${PLUGIN_AUTHOR:-OpenAI Codex}"
 PLUGIN_MIN_VERSION="${PLUGIN_MIN_VERSION:-6.12.0}"
 PLUGIN_URL="${PLUGIN_URL:-https://raw.githubusercontent.com/REPLACE_ME/ca_server_docker/main/unraid-plugin/step-ca-webgui-acme.plg}"
@@ -51,6 +51,9 @@ cat > "${OUT_FILE}" <<EOF
 
 <CHANGES>
 ### ${PLUGIN_VERSION}
+- Add an "Additional domains" setting so the WebGUI certificate can carry extra names such as \`n5-pro.lan\`. Renewal issues a fresh certificate when the installed one does not cover every configured name.
+
+### 2026.09.22
 - Stop the renewal cron job from also appending to issue.log. The script already tees its own output there, so every line was logged twice.
 - Remove previously installed plugin files before installing, since Unraid never overwrites an existing file and in-place updates otherwise only took effect after a reboot.
 
